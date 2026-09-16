@@ -1,0 +1,257 @@
+{
+  "version": 1,
+  "author": "Smart Hub Builder",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "board-esp32-s3-devkitc-1", "id": "esp", "top": 0, "left": 0, "attrs": {} },
+    {
+      "type": "wokwi-text",
+      "id": "lbl_oled",
+      "top": -249.6,
+      "left": -211.2,
+      "attrs": { "text": "MAIN DISPLAY (OLED)" }
+    },
+    { "type": "wokwi-ssd1306", "id": "oled1", "top": -214.1, "left": -209.3, "attrs": {} },
+    {
+      "type": "wokwi-text",
+      "id": "lbl_tgt",
+      "top": 67.2,
+      "left": 201.6,
+      "attrs": { "text": "SET TARGETS" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn_t_ph_up",
+      "top": -3.4,
+      "left": 115.2,
+      "attrs": { "color": "green", "label": "pH+" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn_t_ph_dn",
+      "top": -3.4,
+      "left": 172.8,
+      "attrs": { "color": "red", "label": "pH-" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn_t_ec_up",
+      "top": -3.4,
+      "left": 259.2,
+      "attrs": { "color": "green", "label": "EC+" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn_t_ec_dn",
+      "top": -3.4,
+      "left": 316.8,
+      "attrs": { "color": "red", "label": "EC-" }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "lbl_stage",
+      "top": -249.6,
+      "left": 153.6,
+      "attrs": { "text": "GROWTH STAGE" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn_stage_seed",
+      "top": -214.6,
+      "left": 115.2,
+      "attrs": { "color": "yellow", "label": "SEED" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn_stage_veg",
+      "top": -214.6,
+      "left": 230.4,
+      "attrs": { "color": "green", "label": "VEG" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn_stage_bloom",
+      "top": -214.6,
+      "left": 172.8,
+      "attrs": { "color": "purple", "label": "BLOOM" }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "lbl_power",
+      "top": 28.8,
+      "left": -220.8,
+      "attrs": { "text": "MAIN POWER" }
+    },
+    { "type": "wokwi-slide-switch", "id": "swPower", "top": 23.6, "left": -112.1, "attrs": {} },
+    {
+      "type": "wokwi-text",
+      "id": "lbl_float",
+      "top": 140,
+      "left": -220.8,
+      "attrs": { "text": "FLOAT SWITCH" }
+    },
+    { "type": "wokwi-slide-switch", "id": "swFloat", "top": 135, "left": -92.9, "attrs": {} },
+    {
+      "type": "wokwi-text",
+      "id": "lbl_temp",
+      "top": 182.4,
+      "left": -220.8,
+      "attrs": { "text": "TEMP PROBE" }
+    },
+    { "type": "wokwi-ds18b20", "id": "temp1", "top": 210.87, "left": -82.32, "attrs": {} },
+    {
+      "type": "wokwi-resistor",
+      "id": "r1",
+      "top": 187.15,
+      "left": -105.6,
+      "attrs": { "value": "4700" }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "lbl_rgb",
+      "top": -153.6,
+      "left": 9.6,
+      "attrs": { "text": "STATUS LED" }
+    },
+    { "type": "wokwi-rgb-led", "id": "rgb1", "top": -130.4, "left": 20.3, "attrs": {} },
+    {
+      "type": "wokwi-text",
+      "id": "lbl_buzzer",
+      "top": -96,
+      "left": -67.2,
+      "attrs": { "text": "BUZZER" }
+    },
+    { "type": "wokwi-buzzer", "id": "buzzer", "top": -74.4, "left": -75, "attrs": {} },
+    {
+      "type": "wokwi-text",
+      "id": "lbl_sim",
+      "top": 249.6,
+      "left": 153.6,
+      "attrs": { "text": "SIMULATE pH & EC PROBES" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn_s_ph_up",
+      "top": 179,
+      "left": 115.2,
+      "attrs": { "color": "green", "label": "pH+" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn_s_ph_dn",
+      "top": 179,
+      "left": 172.8,
+      "attrs": { "color": "red", "label": "pH-" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn_s_ec_up",
+      "top": 179,
+      "left": 259.2,
+      "attrs": { "color": "green", "label": "EC+" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn_s_ec_dn",
+      "top": 179,
+      "left": 316.8,
+      "attrs": { "color": "red", "label": "EC-" }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "lbl_pumps",
+      "top": -134.4,
+      "left": 153.6,
+      "attrs": { "text": "THE 5 ACTUATOR PUMPS" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "pumpWater",
+      "top": -109.2,
+      "left": 128.6,
+      "attrs": { "color": "blue", "label": "WATER" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "pumpN",
+      "top": -109.2,
+      "left": 186.2,
+      "attrs": { "color": "green", "label": "TANK N" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "pumpP",
+      "top": -109.2,
+      "left": 223,
+      "attrs": { "color": "orange", "label": "TANK P" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "pumpK",
+      "top": -109.2,
+      "left": 263,
+      "attrs": { "color": "red", "label": "TANK K" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "pumpPH",
+      "top": -109.2,
+      "left": 303,
+      "attrs": { "color": "magenta", "label": "pH DOWN" }
+    }
+  ],
+  "connections": [
+    [ "esp:GND.1", "swPower:1", "black", [ "v0" ] ],
+    [ "esp:6", "swPower:2", "green", [ "v0" ] ],
+    [ "esp:GND.1", "swFloat:1", "black", [ "v0" ] ],
+    [ "esp:5", "swFloat:2", "green", [ "v0" ] ],
+    [ "esp:3V3.1", "temp1:VDD", "red", [ "v0" ] ],
+    [ "esp:GND.1", "temp1:GND", "black", [ "v0" ] ],
+    [ "esp:4", "temp1:DQ", "yellow", [ "v0" ] ],
+    [ "esp:3V3.1", "r1:1", "red", [ "v0" ] ],
+    [ "esp:4", "r1:2", "yellow", [ "v0" ] ],
+    [ "esp:15", "rgb1:R", "red", [ "v0" ] ],
+    [ "esp:16", "rgb1:G", "green", [ "v0" ] ],
+    [ "esp:17", "rgb1:B", "blue", [ "v0" ] ],
+    [ "esp:GND.2", "rgb1:COM", "black", [ "v0" ] ],
+    [ "esp:18", "buzzer:PLUS", "purple", [ "v0" ] ],
+    [ "esp:GND.2", "buzzer:MINUS", "black", [ "v0" ] ],
+    [ "esp:10", "pumpWater:A", "blue", [ "v0" ] ],
+    [ "esp:GND.2", "pumpWater:C", "black", [ "v0" ] ],
+    [ "esp:11", "pumpN:A", "green", [ "v0" ] ],
+    [ "esp:GND.2", "pumpN:C", "black", [ "v0" ] ],
+    [ "esp:12", "pumpP:A", "orange", [ "v0" ] ],
+    [ "esp:GND.2", "pumpP:C", "black", [ "v0" ] ],
+    [ "esp:13", "pumpK:A", "red", [ "v0" ] ],
+    [ "esp:GND.2", "pumpK:C", "black", [ "v0" ] ],
+    [ "esp:14", "pumpPH:A", "magenta", [ "v0" ] ],
+    [ "esp:GND.2", "pumpPH:C", "black", [ "v0" ] ],
+    [ "esp:3V3.1", "oled1:VCC", "red", [ "v0" ] ],
+    [ "esp:GND.1", "oled1:GND", "black", [ "v0" ] ],
+    [ "esp:8", "oled1:SDA", "cyan", [ "v0" ] ],
+    [ "esp:9", "oled1:SCL", "cyan", [ "v0" ] ],
+    [ "esp:41", "btn_t_ph_up:1.l", "green", [ "v0" ] ],
+    [ "esp:GND.1", "btn_t_ph_up:2.l", "black", [ "v0" ] ],
+    [ "esp:42", "btn_t_ph_dn:1.l", "red", [ "v0" ] ],
+    [ "esp:GND.1", "btn_t_ph_dn:2.l", "black", [ "v0" ] ],
+    [ "esp:45", "btn_t_ec_up:1.l", "green", [ "v0" ] ],
+    [ "esp:GND.1", "btn_t_ec_up:2.l", "black", [ "v0" ] ],
+    [ "esp:46", "btn_t_ec_dn:1.l", "red", [ "v0" ] ],
+    [ "esp:GND.1", "btn_t_ec_dn:2.l", "black", [ "v0" ] ],
+    [ "esp:39", "btn_stage_seed:1.l", "yellow", [ "v0" ] ],
+    [ "esp:GND.1", "btn_stage_seed:2.l", "black", [ "v0" ] ],
+    [ "esp:40", "btn_stage_veg:1.l", "green", [ "v0" ] ],
+    [ "esp:GND.1", "btn_stage_veg:2.l", "black", [ "v0" ] ],
+    [ "esp:21", "btn_stage_bloom:1.l", "purple", [ "v0" ] ],
+    [ "esp:GND.1", "btn_stage_bloom:2.l", "black", [ "v0" ] ],
+    [ "esp:1", "btn_s_ph_up:1.l", "green", [ "v0" ] ],
+    [ "esp:GND.1", "btn_s_ph_up:2.l", "black", [ "v0" ] ],
+    [ "esp:2", "btn_s_ph_dn:1.l", "red", [ "v0" ] ],
+    [ "esp:GND.1", "btn_s_ph_dn:2.l", "black", [ "v0" ] ],
+    [ "esp:3", "btn_s_ec_up:1.l", "green", [ "v0" ] ],
+    [ "esp:GND.1", "btn_s_ec_up:2.l", "black", [ "v0" ] ],
+    [ "esp:7", "btn_s_ec_dn:1.l", "red", [ "v0" ] ],
+    [ "esp:GND.1", "btn_s_ec_dn:2.l", "black", [ "v0" ] ]
+  ],
+  "dependencies": {}
+}
