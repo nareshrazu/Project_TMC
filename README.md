@@ -66,3 +66,45 @@ lib_deps =
     adafruit/Adafruit GFX Library @ ^1.11.5
     milesburton/DallasTemperature @ ^3.11.0
     paulstoffregen/OneWire @ ^2.3.7
+```
+
+---
+
+## 🚀 How to Build & Run
+
+### Option 1: Wokwi Simulator in VS Code
+
+1. Open the repository root folder in VS Code.
+2. Open the Command Palette (`Ctrl+Shift+P` or `Cmd+Shift+P`).
+3. Run **Wokwi: Start Simulator** (uses `diagram.json`).
+
+### Option 2: Flash to Physical Hardware
+
+1. Connect your ESP32-S3 board to your PC via USB.
+2. Click **Build** and **Upload** in PlatformIO.
+3. Open **Serial Monitor** at `115200` baud rate to inspect system telemetry.
+
+---
+
+## 📁 Repository Structure
+
+```text
+Project_TMC/
+├── diagram.json          # Wokwi simulation diagram & pin connection map
+├── platformio.ini        # PlatformIO environment & library configuration
+├── include/
+│   └── CropProfiles.h    # Target pH, EC, and dosing pulse datasets
+├── src/
+│   └── main.cpp          # Main control loops, state machine, and watchdogs
+└── README.md             # Project documentation
+
+```
+
+```
+
+<ElicitationsGroup message="What would you like to work on next for Project_TMC?">
+  <Elicitation label="Review CropProfiles.h header code" query="Can you generate the matching CropProfiles.h file to ensure all crop profiles match main.cpp?"/>
+  <Elicitation label="Create a standard .gitignore file" query="Can you create a standard .gitignore file for PlatformIO, VS Code, and C++ to keep the GitHub repo clean?"/>
+</ElicitationsGroup>
+
+```
