@@ -5,49 +5,55 @@
 ![Wokwi](https://img.shields.io/badge/Simulator-Wokwi-green.svg)
 ![Language](https://img.shields.io/badge/Code-C%2B%2B-00599C.svg)
 
-An automated hydroponics monitoring and dosing system built on the **ESP32-S3 DevKitC-1**. This project features non-blocking multi-sensor tracking, stage-based growth presets, a 5-actuator pump dosing controller, and a dual-zone SSD1306 OLED interface with real-time live dosing timer metrics.
+An automated hydroponics monitoring and dosing system built on the **ESP32-S3 DevKitC-1**. Features non-blocking multi-sensor tracking, stage-based growth presets, a 5-actuator pump controller, integrated industrial safety watchdogs, and a dual-zone SSD1306 OLED interface.
 
 ---
 
-## ⚡ Key Features
+## ⚡ Safety Watchdogs & Hardware Features
 
-* **Non-Blocking Architecture:** High-speed `millis()` timers eliminate input lag and UI latency.
-* **Dual-Zone OLED Interface:** 
-  * **Left Panel:** Live sensor telemetry (pH, EC, Temperature).
-  * **Right Panel:** Live active dosing duration timer (in seconds) or the last recorded pump action.
-* **5-Actuator Pump Controller:** Automated control lines for Water, Tank N, Tank P, Tank K, and pH Down.
-* **Growth Stage Presets:** Hardware buttons for rapid selection of **Seed**, **Veg**, and **Bloom** profiles.
-* **Safety System:** Hardware switch monitoring for main power cut-off, float/water level safety, and audio/visual alarm feedback.
-* **Wokwi Simulation Ready:** Full VS Code Wokwi integration for instant hardware testing without physical wiring.
-
----
-
-## 📌 ESP32-S3 Hardware Pinout Table
-
-| Hardware Component | ESP32-S3 Pin | Signal / Notes |
-| :--- | :--- | :--- |
-| **SSD1306 OLED Display** | GPIO 8 (SDA), GPIO 9 (SCL) | I2C Display Channel (3.3V) |
-| **DS18B20 Temp Probe** | GPIO 4 | OneWire Data (Requires 4.7kΩ Pull-Up) |
-| **Main Power Switch** | GPIO 6 | System Power Intercept (Active Low) |
-| **Water Level Float Switch** | GPIO 5 | Water Level Detection (Active Low) |
-| **Status RGB LED** | GPIO 15 (R), 16 (G), 17 (B) | Common Cathode Output |
-| **Piezo Buzzer** | GPIO 18 | Alarm Audio Output |
-| **Pump Outputs (LEDs)** | GPIO 10 (Water), 11 (N), 12 (P), 13 (K), 14 (pH Down) | Active High Relay/Transistor Control |
-| **Growth Stage Buttons** | GPIO 39 (Seed), 40 (Veg), 21 (Bloom) | Stage Selection Inputs |
-| **Target Adjust Buttons**| GPIO 41 (pH+), 42 (pH-), 45 (EC+), 46 (EC-) | Target Calibration Inputs |
-| **Simulated Probe Buttons**| GPIO 1 (pH+), 2 (pH-), 3 (EC+), 7 (EC-) | Diagnostic Probe Simulation Inputs |
+* **Master Kill Switch (GPIO 6):** Physical switch intercept that immediately turns off all pump actuators, turns off the status RGB LED, and halts software execution.
+* **Water Fill Watchdog:** Auto-shuts off the water pump and enters a red lockout error state with an audio alarm if the float switch isn't triggered within the maximum time limit (`WATER_TIMEOUT`).
+* **Relay Boot-Glitch Protection:** Pre-sets all pump control pins to `LOW` before initializing them as `OUTPUT`, preventing relay clicks during ESP32 startup.
+* **Float Switch Debouncing:** Uses a 10-cycle consecutive read check to prevent relay chatter caused by water surface ripples.
+* **Multi-Color RGB Status LED:**
+  * 🟢 **Green:** Idle / System Monitoring
+  * 🔵 **Blue:** Filling Water Reservoir
+  * 🟡 **Yellow:** Active Nutrient or pH Dosing
+  * 🔴 **Red:** System Lockout Error
+* **Non-Blocking Architecture:** Asynchronous DS18B20 temperature reads and non-blocking `millis()` timing loops keep input responses instant.
+* **Strict Error Lockout Recovery:** Prevents oscillating failure loops by clearing the dosing attempt counter only when both pH and EC values return safely inside their target deadbands.
 
 ---
 
-## 🛠️ Software Setup & Prerequisites
+## 📌 ESP32-S3 Pinout Alignment
 
-### 1. Tools Required
+| Hardware Module | ESP32-S3 Pin | Hardware Mode / Logic | Description |
+| :--- | :--- | :--- | :--- |
+| **OLED Display** | GPIO 8 (SDA), GPIO 9 (SCL) | I2C Channel (0x3C) | 128x64 SSD1306 Display |
+| **Master Power Switch** | GPIO 6 | Digital Input (`INPUT_PULLUP`) | Active LOW (GND Switched) |
+| **Float Level Switch** | GPIO 5 | Digital Input (`INPUT_PULLUP`) | Active LOW (GND Switched) |
+| **Temp Sensor (DS18B20)** | GPIO 4 | OneWire Bus | Requires 4.7kΩ pull-up to 3.3V |
+| **Status RGB LED** | GPIO 15 (R), 16 (G), 17 (B) | Common Cathode Output | Active High |
+| **Alarm Buzzer** | GPIO 18 | Piezo Output | 1kHz Tone Feedback |
+| **Water Valve Pump** | GPIO 10 | Digital Output | Active High |
+| **Tank N Pump (Pump A)** | GPIO 11 | Digital Output | Active High |
+| **Tank P Pump (Pump B)** | GPIO 12 | Digital Output | Active High |
+| **Tank K Pump (Pump C)** | GPIO 13 | Digital Output | Active High |
+| **pH Down Pump** | GPIO 14 | Digital Output | Active High |
+| **Target Adjust Buttons** | GPIO 41 (pH+), 42 (pH-), 45 (EC+), 46 (EC-) | Digital Input (`INPUT_PULLUP`) | Active LOW |
+| **Growth Stage Buttons** | GPIO 39 (Seed), 40 (Veg), 21 (Bloom) | Digital Input (`INPUT_PULLUP`) | Active LOW |
+| **Probe Sim Buttons** | GPIO 1 (pH+), 2 (pH-), 3 (EC+), 7 (EC-) | Digital Input (`INPUT_PULLUP`) | Active LOW (Diagnostic) |
+
+---
+
+## 🛠️ Software Prerequisites
+
 * [Visual Studio Code](https://code.visualstudio.com/)
-* [PlatformIO IDE Extension](https://platformio.org/platformio-ide)
-* [Wokwi Simulator Extension](https://wokwi.com/vscode)
+* **VS Code Extensions:**
+  * [PlatformIO IDE](https://platformio.org/platformio-ide)
+  * [Wokwi Simulator](https://wokwi.com/vscode)
 
-### 2. Project Configuration (`platformio.ini`)
-Ensure your `platformio.ini` file in the project root includes the following settings:
+### `platformio.ini` Dependencies
 
 ```ini
 [env:esp32-s3-devkitc-1]
