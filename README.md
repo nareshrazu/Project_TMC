@@ -25,11 +25,12 @@ An automated hydroponics monitoring and dosing system built on the **ESP32-S3 De
 
 ---
 
-## 📌 ESP32-S3 Pinout Alignment
+### 📌 ESP32-S3 Pinout Alignment
 
 | Hardware Module | ESP32-S3 Pin | Hardware Mode / Logic | Description |
-| :--- | :--- | :--- | :--- |
-| **OLED Display** | GPIO 8 (SDA), GPIO 9 (SCL) | I2C Channel (0x3C) | 128x64 SSD1306 Display |
+| --- | --- | --- | --- |
+| **OLED Display & RTC Module** | GPIO 8 (SDA), GPIO 9 (SCL) | I2C Channel (0x3C / 0x68) | Shared I2C Bus for 128x64 SSD1306 & DS3231 RTC |
+| **SD Card Module (SPI)** | GPIO 12 (SCK), GPIO 13 (MISO), GPIO 11 (MOSI), GPIO 10 (CS)* | SPI Bus / Digital Output | MicroSD Card for CSV Telemetry Logging *(Note: Adjust pins if using custom hardware SPI mappings)* |
 | **Master Power Switch** | GPIO 6 | Digital Input (`INPUT_PULLUP`) | Active LOW (GND Switched) |
 | **Float Level Switch** | GPIO 5 | Digital Input (`INPUT_PULLUP`) | Active LOW (GND Switched) |
 | **Temp Sensor (DS18B20)** | GPIO 4 | OneWire Bus | Requires 4.7kΩ pull-up to 3.3V |
@@ -43,12 +44,6 @@ An automated hydroponics monitoring and dosing system built on the **ESP32-S3 De
 | **Target Adjust Buttons** | GPIO 41 (pH+), 42 (pH-), 45 (EC+), 46 (EC-) | Digital Input (`INPUT_PULLUP`) | Active LOW |
 | **Growth Stage Buttons** | GPIO 39 (Seed), 40 (Veg), 21 (Bloom) | Digital Input (`INPUT_PULLUP`) | Active LOW |
 | **Probe Sim Buttons** | GPIO 1 (pH+), 2 (pH-), 3 (EC+), 7 (EC-) | Digital Input (`INPUT_PULLUP`) | Active LOW (Diagnostic) |
-
----
-
-Yes, absolutely! Now that you have integrated the real-time clock (RTC), upgraded the telemetry to be fully state-aware, and built in safety interlocks, updating your `README.md` is a great way to keep your project documentation clean and professional.
-
-Here is a comprehensive, updated `README.md` template you can drop straight into your project. It captures all the production-grade features you've built out so far:
 
 ---
 
