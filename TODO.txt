@@ -1,1 +1,11 @@
 PID control System
+
+Missing	Light, air temperature, humidity, dissolved oxygen	Long days (>12–14 h) and heat make coriander bolt (go to flower)	❌ For coriander these matter more than fine dosing
+
+Coriander is often harvested cut-and-come-again. The profile has no regrowth phase after harvest.
+
+The physical system only has a pH-down pump. If pH drops too low or EC spikes too high, the system correctly stops dosing, but physical dilution requires manual human intervention (adding fresh water). UI/Buzzer alarms for out-of-bounds readings will be added in a future pass.
+
+// Standardizes the EC reading to 25°C so dosing is always perfectly accurate
+float compensatedEC = rawEC / (1.0 + 0.02 * (currentTemp - 25.0));
+

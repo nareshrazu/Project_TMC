@@ -21,27 +21,30 @@ struct DailyProfile {
 const DailyProfile corianderSchedule[] = {
     // --- EARLY SEEDLING (Days 1-7) ---
     // Minimal watering (3x a day for 5 mins) to prevent drowning tiny roots.
-    { 1,  "Seedling D1", 6.0, 0.6, 600, 600, 400, false, 3, 5 },
-    { 2,  "Seedling D2", 6.0, 0.6, 600, 600, 400, false, 3, 5 },
-    { 3,  "Seedling D3", 6.0, 0.6, 600, 600, 400, false, 3, 5 },
-    { 4,  "Seedling D4", 6.0, 0.6, 600, 600, 400, false, 3, 5 },
-    { 5,  "Seedling D5", 6.0, 0.6, 600, 600, 400, false, 3, 5 },
-    { 6,  "Seedling D6", 6.0, 0.6, 600, 600, 400, false, 3, 5 },
-    { 7,  "Seedling D7", 6.0, 0.6, 600, 600, 400, false, 3, 5 },
+    // { day, phaseName, targetpH, targetEC, durN, durP, durK, isFlush, irrigationCycles, irrigationMins }
+
+    // --- EARLY SEEDLING / GERMINATION (Days 1-7) ---
+    // Germination phase: Seeds rely on cotyledons. Plain water only, media kept lightly moist, no flooding.
+    // isFlush set to 'true' tells the state machine to ignore the EC sensor and just water.
+    { 1,  "Seedling D1", 6.0, 0.0, 0, 0, 0, true, 2, 1 },
+    { 2,  "Seedling D2", 6.0, 0.0, 0, 0, 0, true, 2, 1 },
+    { 3,  "Seedling D3", 6.0, 0.0, 0, 0, 0, true, 2, 1 },
+    { 4,  "Seedling D4", 6.0, 0.0, 0, 0, 0, true, 2, 1 },
+    { 5,  "Seedling D5", 6.0, 0.0, 0, 0, 0, true, 2, 1 },
+    { 6,  "Seedling D6", 6.0, 0.0, 0, 0, 0, true, 2, 1 },
+    { 7,  "Seedling D7", 6.0, 0.0, 0, 0, 0, true, 2, 1 },
 
     // --- LATE SEEDLING (Days 8-14) ---
-    // Increased EC. Water 4x a day as true leaves form and water uptake increases.
-    { 8,  "Seedling D8", 6.0, 0.8, 800, 800, 600, false, 4, 5 },
-    { 9,  "Seedling D9", 6.0, 0.8, 800, 800, 600, false, 4, 5 },
-    { 10, "Seedling D10", 6.0, 0.8, 800, 800, 600, false, 4, 5 },
-    { 11, "Seedling D11", 6.0, 0.8, 800, 800, 600, false, 4, 5 },
-    { 12, "Seedling D12", 6.0, 0.8, 800, 800, 600, false, 4, 5 },
-    { 13, "Seedling D13", 6.0, 0.8, 800, 800, 600, false, 4, 5 },
-    { 14, "Seedling D14", 6.0, 0.8, 800, 800, 600, false, 4, 5 },
+    // True leaves form. Introduce light nutrients (EC 0.6) and bump watering slightly.
+    { 8,  "Seedling D8",  6.0, 0.6, 600, 600, 400, false, 3, 3 },
+    { 9,  "Seedling D9",  6.0, 0.6, 600, 600, 400, false, 3, 3 },
+    { 10, "Seedling D10", 6.0, 0.6, 600, 600, 400, false, 3, 3 },
+    { 11, "Seedling D11", 6.0, 0.6, 600, 600, 400, false, 3, 3 },
+    { 12, "Seedling D12", 6.0, 0.6, 600, 600, 400, false, 3, 3 },
+    { 13, "Seedling D13", 6.0, 0.6, 600, 600, 400, false, 3, 3 },
+    { 14, "Seedling D14", 6.0, 0.6, 600, 600, 400, false, 3, 3 },
 
-    // --- TRANSITION FLUSH (Day 15) ---
-    // Clears out early salts. No nutrients added.
-    { 15, "Trans Flush",  6.0, 0.2, 0,   0,   0,   true,  4, 5 },
+    { 15, "Trans Veg",  6.0, 1.0, 1000, 800, 800, false, 4, 5 },
 
     // --- EARLY VEGETATIVE (Days 16-25) ---
     // High Nitrogen focus. Watering bumped to 5x a day for 8 minutes.
@@ -67,10 +70,7 @@ const DailyProfile corianderSchedule[] = {
     { 32, "Late Veg D32", 6.2, 1.5, 1500, 1200, 1400, false, 6, 10 },
     { 33, "Late Veg D33", 6.2, 1.5, 1500, 1200, 1400, false, 6, 10 },
     { 34, "Late Veg D34", 6.2, 1.5, 1500, 1200, 1400, false, 6, 10 },
-
-    // --- SYSTEM SALT FLUSH (Day 35) ---
-    // Heavy flush to prevent nutrient lockout before the final mature push.
-    { 35, "Salt Flush",   6.0, 0.2, 0,    0,    0,    true,  6, 10 },
+    { 35, "Late Veg D35", 6.2, 1.5, 1500, 1200, 1400, false, 6, 10 },
 
     // --- MATURE GROWTH (Days 36-42) ---
     // Peak EC to force essential oil production. Heavy transpiration demands 8x watering.
@@ -81,12 +81,9 @@ const DailyProfile corianderSchedule[] = {
     { 40, "Mature D40",   6.2, 1.8, 1800, 1500, 1600, false, 8, 10 },
     { 41, "Mature D41",   6.2, 1.8, 1800, 1500, 1600, false, 8, 10 },
     { 42, "Mature D42",   6.2, 1.8, 1800, 1500, 1600, false, 8, 10 },
-
-    // --- PRE-HARVEST FLUSH (Days 43-45) ---
-    // Fresh water only to strip residual salts for better leaf taste. High watering freq maintained.
-    { 43, "Harvest F1",   6.0, 0.2, 0,    0,    0,    true,  8, 10 },
-    { 44, "Harvest F2",   6.0, 0.2, 0,    0,    0,    true,  8, 10 },
-    { 45, "Harvest F3",   6.0, 0.2, 0,    0,    0,    true,  8, 10 }
+    { 43, "Mature D43",   6.2, 1.8, 1800, 1500, 1600, false, 8, 10 },
+    { 44, "Mature D44",   6.2, 1.8, 1800, 1500, 1600, false, 8, 10 },
+    { 45, "Mature D45",   6.2, 1.8, 1800, 1500, 1600, false, 8, 10 }
 };
 
 // Dynamically calculates to 45 so we can safely bounds-check the array

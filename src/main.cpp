@@ -78,7 +78,7 @@ Preferences preferences;
   const unsigned long MIX_DELAY_NUTRIENT = 2000;
   const unsigned long MIX_DELAY_PH       = 2000;
   const unsigned long PUMP_PULSE_PH      = 2000;
-  const unsigned long WATER_TIMEOUT      = 2000;
+  const unsigned long WATER_TIMEOUT      = 15000;
 #else
   const unsigned long MIX_DELAY_NUTRIENT = 120000; // 2 minutes
   const unsigned long MIX_DELAY_PH       = 180000; // 3 minutes
@@ -97,6 +97,8 @@ bool isCurrentlyFlushing = false;
 String currentPhaseName = "";
 uint8_t dailyCycles = 0;
 uint8_t cycleDurationMins = 0;
+bool oledAvailable = false;
+bool manualOverride = false;
 
 float targetpH = 6.0, targetEC = 2.0;
 unsigned long durA = 1000, durB = 1000, durC = 1000;
@@ -156,7 +158,8 @@ void turnOffAllPumps() {
 
 // Float Switch Hardware Interrupt
 void IRAM_ATTR floatSwitchISR() {
-  tankEmptyISRFlag = (digitalRead(PIN_SW_FLOAT) == TANK_EMPTY);
+  // Use native ESP-IDF function for strict Core 3.x IRAM safety
+  tankEmptyISRFlag = (gpio_get_level((gpio_num_t)PIN_SW_FLOAT) == TANK_EMPTY);
   if(tankEmptyISRFlag) {
     // Immediate silicon-level abort
     digitalWrite(PIN_PUMP_A, PUMP_OFF);
@@ -188,7 +191,6 @@ void dumpSDCardToSerial() {
     }
     dataFile.close();
     Serial.println("--- END TEST RUN DATA ---\n");
-    SD.remove("/data.csv"); 
   } else {
     Serial.println("Error opening data.csv for readout.");
   }
@@ -278,8 +280,8 @@ void loadProfileForDay(int day, bool isBoot = false) {
     durA = 0; durB = 0; durC = 0;
   }
 
-  // Update targets and NVS if this is a standard day transition
-  if (!isBoot) {
+  // Update targets and NVS if this is a standard day transition AND we aren't in manual override
+  if (!isBoot && !manualOverride) {
     targetpH = corianderSchedule[idx].targetpH;
     targetEC = corianderSchedule[idx].targetEC;
     preferences.putFloat("target_ph", targetpH);
@@ -298,7 +300,8 @@ void setup() {
 
   const int outputPins[] = {PIN_PUMP_A, PIN_PUMP_B, PIN_PUMP_C, PIN_PUMP_PH, PIN_PUMP_WATER, PIN_PUMP_IRRIGATE, PIN_RGB_R, PIN_RGB_G, PIN_RGB_B, PIN_BUZZER};
   for (int pin : outputPins) {
-    digitalWrite(pin, (pin == PIN_BUZZER || pin >= PIN_RGB_R) ? LOW : PUMP_OFF); 
+    bool isLEDorBuzzer = (pin == PIN_RGB_R || pin == PIN_RGB_G || pin == PIN_RGB_B || pin == PIN_BUZZER);
+    digitalWrite(pin, isLEDorBuzzer ? LOW : PUMP_OFF); 
     pinMode(pin, OUTPUT);
   }
 
@@ -331,7 +334,9 @@ void setup() {
 
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println("OLED Failed");
-    for(;;);
+    // Notice we deleted the for(;;);
+  } else {
+    oledAvailable = true;
   }
 
   // Init SD Card
@@ -350,6 +355,9 @@ void setup() {
   
   // NVS Memory Boot Recovery
   preferences.begin("grow_data", false);
+
+  //add this line to remember if the user was in manual mode before a power cut:
+  manualOverride = preferences.getBool("manual_ovr", false);
 
   #if TESTING_MODE
     preferences.clear(); // Wipes memory on every boot so CropProfiles.h is always used
@@ -370,10 +378,11 @@ void setup() {
   targetEC = preferences.getFloat("target_ec");
 
   if (sdInitialized) {
-    writeToSD("0,TEST_EVENT,BOOT_TEST,0,0,6.0,2.0,24.0");
-    writeToSD("1000,PULSE_ON,TANK_N,1000,1,6.0,2.1,24.0");
-    Serial.println("Dummy data injected into SD card.");
-    Serial.println("Timestamp,Day,Phase,EventType,PumpName,DurationMs,Attempt,pH(Target),EC(Target),Temp");  }
+    // Write a clean CSV header that perfectly matches the telemetry and event logs
+    writeToSD("Timestamp,Day,Phase,EventType,PumpName,DurationMs,Attempt,pH(Target),EC(Target),Temp");
+    Serial.println("Timestamp,Day,Phase,EventType,PumpName,DurationMs,Attempt,pH(Target),EC(Target),Temp");  
+    Serial.println("CSV Header written to SD card.");
+  }
 }
 
 void loop() {
@@ -383,6 +392,11 @@ void loop() {
     turnOffAllPumps();
     setRGB(0, 0, 0); 
     currentDosingState = IDLE;
+
+    // --- ADD THESE TWO LINES ---
+    dosingError = false;   // Clears the red error lockout
+    dosingAttempts = 0;    // Resets the 15-attempt counter
+    // ---------------------------
     
     // Dump SD Card logs when the system is switched off
     if (!logDumped) {
@@ -408,13 +422,23 @@ void loop() {
   processSequentialDosing();
   handleIrrigation();
 
-  // Automatic 24-Hour Day Advancement
-  if (millis() - lastDayAdvanceMillis >= MILLIS_PER_DAY) {
-    lastDayAdvanceMillis = millis();
-    if (currentDay < TOTAL_DAYS) {
-      loadProfileForDay(currentDay + 1); 
+  #if !TESTING_MODE
+    // PRODUCTION: Automatic 24-Hour Day Advancement via RTC Midnight Rollover
+    static int lastRecordedDate = -1;
+    DateTime now = rtc.now();
+    
+    if (lastRecordedDate == -1) {
+      lastRecordedDate = now.day(); // Initialize on first loop
     }
-  }
+    
+    // When the physical day of the month changes (Midnight)
+    if (now.day() != lastRecordedDate) {
+      lastRecordedDate = now.day();
+      if (currentDay < TOTAL_DAYS) {
+        loadProfileForDay(currentDay + 1); 
+      }
+    }
+  #endif
   
   // Update UI Non-Blockingly
   if (millis() - lastDisplayUpdate > 500 || forceDisplayUpdate) {
@@ -439,10 +463,30 @@ void processInputs() {
         beep(50); 
 
         switch(i) {
-          case 0: targetpH += 0.05; preferences.putFloat("target_ph", targetpH); break;
-          case 1: targetpH -= 0.05; preferences.putFloat("target_ph", targetpH); break;
-          case 2: targetEC += 0.05; preferences.putFloat("target_ec", targetEC); break;
-          case 3: targetEC -= 0.05; preferences.putFloat("target_ec", targetEC); break;
+          case 0: 
+            targetpH += 0.05; 
+            if (targetpH > 8.0) targetpH = 8.0; // Absolute Max pH
+            manualOverride = true;
+            preferences.putFloat("target_ph", targetpH); 
+            break;
+          case 1: 
+            targetpH -= 0.05; 
+            if (targetpH < 4.0) targetpH = 4.0; // Absolute Min pH
+            manualOverride = true;
+            preferences.putFloat("target_ph", targetpH); 
+            break;
+          case 2: 
+            targetEC += 0.05; 
+            if (targetEC > 4.0) targetEC = 4.0; // Absolute Max EC
+            manualOverride = true;
+            preferences.putFloat("target_ec", targetEC); 
+            break;
+          case 3: 
+            targetEC -= 0.05; 
+            if (targetEC < 0.0) targetEC = 0.0; // Absolute Min EC
+            manualOverride = true;
+            preferences.putFloat("target_ec", targetEC); 
+            break;
           
           case 4: loadProfileForDay(currentDay - 1); break; 
           case 5: loadProfileForDay(currentDay + 1); break; 
@@ -464,9 +508,19 @@ void processInputs() {
 
   if (millis() - lastTempReq >= 2000) {
     float tempC = tempSensor.getTempCByIndex(0);
-    if (tempC > -50.0 && tempC < 85.0) currentTemp = tempC;
-    tempValid = (currentTemp >= 15.0 && currentTemp <= 28.0); // Temperature Guard check
-    tempSensor.requestTemperatures(); 
+    
+    // The Dallas library returns -127.0 if the sensor is disconnected
+    if (tempC <= -100.0) {
+      tempValid = false; // Sensor is dead/unplugged. Force safety shutdown immediately!
+    } else {
+      // 85.0 is a power-on error state, so we ignore it, otherwise update currentTemp
+      if (tempC < 85.0) currentTemp = tempC; 
+      
+      // Standard Temperature Guard check (lowered to 24C per agronomy review)
+      tempValid = (currentTemp >= 15.0 && currentTemp <= 24.0); 
+    }
+    
+    tempSensor.requestTemperatures(); // Request next reading asynchronously 
     lastTempReq = millis();
   }
 }
@@ -662,21 +716,34 @@ void handleIrrigation() {
     lastIrrigationStart = millis(); // Reset timer for the new day
   }
 
-// 2. STOP if we have already completed all cycles for today!
+  // Survival Mode Logic: We only delay watering if the system is actively fixing chemistry.
+  // If the dosing system faBls and enters ERROR_LOCKOUT, we bypass the chemistry block to save the plants.
+  bool activelyFixingChemistry = (currentDosingState != IDLE);
+
+  // Do not irrigate if system is off, no cycles scheduled, tank empty, or actively mixing
+  if (!systemActive || dailyCycles == 0 || cycleDurationMins == 0 || tankEmptyISRFlag || activelyFixingChemistry) {
+    return; // Block irrigation only temporarily
+  }
+
+  // 2. STOP if we have already completed all cycles for today!
   if (currentCycleIndex >= dailyCycles && !isIrrigating) {
     
     #if TESTING_MODE
       // Fast-forward testing: Wait 10 seconds after the final watering, then advance to tomorrow
       if (millis() - lastIrrigationStart >= 6000) {
-        loadProfileForDay(currentDay + 1);
-        
-        // Log the automated day transition
-        DateTime now = rtc.now();
-        char logBuf[160];
-        snprintf(logBuf, sizeof(logBuf), "%04d-%02d-%02d %02d:%02d:%02d,DAY_%d,%s,TEST_DAY_ADVANCE,NONE,0,0,pH:%.2f(T:%.2f),EC:%.2f(T:%.2f),Temp:%.1fC",
-                 now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second(), 
-                 currentDay, currentPhaseName.c_str(), currentpH, targetpH, currentEC, targetEC, currentTemp);
-        Serial.println(logBuf);
+
+        // ONLY advance if we haven't reached the end of the crop profile yet
+        if (currentDay < TOTAL_DAYS) {
+          loadProfileForDay(currentDay + 1);
+          
+          // Log the automated day transition
+          DateTime now = rtc.now();
+          char logBuf[160];
+          snprintf(logBuf, sizeof(logBuf), "%04d-%02d-%02d %02d:%02d:%02d,DAY_%d,%s,TEST_DAY_ADVANCE,NONE,0,0,pH:%.2f(T:%.2f),EC:%.2f(T:%.2f),Temp:%.1fC",
+                   now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second(), 
+                   currentDay, currentPhaseName.c_str(), currentpH, targetpH, currentEC, targetEC, currentTemp);
+          Serial.println(logBuf);
+        }
       }
     #endif
     
@@ -725,6 +792,7 @@ void handleIrrigation() {
 }
 
 void updateDisplay() {
+  if (!oledAvailable) return; // Skip drawing if screen is dead
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
@@ -742,8 +810,8 @@ void updateDisplay() {
 
   // pH Box
   display.setCursor(2, 12); display.print("pH ");
-  if (currentpH > targetpH + 0.05) display.print("HI");
-  else if (currentpH < targetpH - 0.05) display.print("LO");
+  if (currentpH > targetpH + 0.20) display.print("HI");
+  else if (currentpH < targetpH - 0.20) display.print("LO");
   else display.print("OK");
 
   display.setTextSize(2);
@@ -755,8 +823,8 @@ void updateDisplay() {
 
   // EC Box
   display.setCursor(67, 12); display.print("EC ");
-  if (currentEC > targetEC + 0.05) display.print("HI");
-  else if (currentEC < targetEC - 0.05) display.print("LO");
+  if (currentEC > targetEC + 0.10) display.print("HI");
+  else if (currentEC < targetEC - 0.10) display.print("LO");
   else display.print("OK");
 
   display.setTextSize(2);
