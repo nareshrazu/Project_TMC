@@ -9,8 +9,19 @@
 #include <SD.h>
 #include "CropProfiles.h"
 #include "RTClib.h"
+#include <esp_task_wdt.h>
+
+#define WDT_TIMEOUT_SECONDS 15
 
 RTC_DS3231 rtc;
+bool rtcAvailable = false;
+
+DateTime getSafeRTCNow() {
+  if (rtcAvailable) {
+    return rtc.now();
+  }
+  return DateTime(2026, 1, 1, 0, 0, 0) + TimeSpan(millis() / 1000);
+}
 
 // --- SYSTEM CONFIGURATION ---
 #define TESTING_MODE true
@@ -79,11 +90,13 @@ Preferences preferences;
   const unsigned long MIX_DELAY_PH       = 2000;
   const unsigned long PUMP_PULSE_PH      = 2000;
   const unsigned long WATER_TIMEOUT      = 15000;
+  const unsigned long TELEMETRY_INTERVAL = 1000;   // 1s in test mode
 #else
   const unsigned long MIX_DELAY_NUTRIENT = 120000; // 2 minutes
   const unsigned long MIX_DELAY_PH       = 180000; // 3 minutes
   const unsigned long PUMP_PULSE_PH      = 250;
   const unsigned long WATER_TIMEOUT      = 300000;
+  const unsigned long TELEMETRY_INTERVAL = 60000;  // 1 minute in production
 #endif
 
 // --- STATE MACHINE ---
@@ -106,6 +119,8 @@ float targetpH = 6.0, targetEC = 2.0;
 unsigned long durA = 1000, durB = 1000, durC = 1000;
 float currentpH = 7.0, currentEC = 0.0, currentTemp = 24.0;
 bool tempValid = true; // Temperature Guard Flag
+bool tempSensorConnected = true;
+bool tempHighAlarm = false;
 
 unsigned long dosingTimer = 0, mixTimer = 0, waterFillTimer = 0;
 unsigned long lastTempReq = 0, lastDisplayUpdate = 0, lastDayAdvanceMillis = 0, lastIrrigationStart = 0;
@@ -203,10 +218,10 @@ void dumpSDCardToSerial() {
 }
 
 void logPulseEvent(const char* pumpName, unsigned long durationMs, int attempt, bool starting) {
-  DateTime now = rtc.now(); // Grab the exact time the event occurred
+  DateTime now = getSafeRTCNow(); // Grab the exact time the event occurred
   
   char logBuf[160];
-  snprintf(logBuf, sizeof(logBuf), "%04d-%02d-%02d %02d:%02d:%02d,DAY_%d,%s,%s,%s,%lu,%d,pH:%.2f(T:%.2f),EC:%.2f(T:%.2f),Temp:%.1fC",
+  snprintf(logBuf, sizeof(logBuf), "%04d-%02d-%02d %02d:%02d:%02d,%d,%s,%s,%s,%lu,%d,%.2f,%.2f,%.2f,%.2f,%.1f",
            now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second(),
            currentDay, currentPhaseName.c_str(), starting ? "PULSE_ON" : "PULSE_OFF", 
            pumpName, durationMs, attempt, currentpH, targetpH, currentEC, targetEC, currentTemp);
@@ -215,13 +230,13 @@ void logPulseEvent(const char* pumpName, unsigned long durationMs, int attempt, 
   writeToSD(String(logBuf));
 }
 
-// Continuous Metric Stream: Fires exactly once per second
+// Telemetry Metrics Stream
 void streamTelemetryMetrics() {
   static unsigned long lastTelemetry = 0;
-  if (millis() - lastTelemetry >= 1000) {
+  if (millis() - lastTelemetry >= TELEMETRY_INTERVAL) {
     lastTelemetry = millis();
     
-    DateTime now = rtc.now(); 
+    DateTime now = getSafeRTCNow(); 
     
     // Default values for idle state
     const char* evtType = "METRIC_TICK";
@@ -245,7 +260,7 @@ void streamTelemetryMetrics() {
     }
     
     char metricBuf[160];
-    snprintf(metricBuf, sizeof(metricBuf), "%04d-%02d-%02d %02d:%02d:%02d,DAY_%d,%s,%s,%s,0,0,pH:%.2f(T:%.2f),EC:%.2f(T:%.2f),Temp:%.1fC",
+    snprintf(metricBuf, sizeof(metricBuf), "%04d-%02d-%02d %02d:%02d:%02d,%d,%s,%s,%s,0,0,%.2f,%.2f,%.2f,%.2f,%.1f",
              now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second(),
              currentDay, currentPhaseName.c_str(), evtType, pumpName, currentpH, targetpH, currentEC, targetEC, currentTemp);
              
@@ -256,6 +271,54 @@ void streamTelemetryMetrics() {
 
 // --- NVS & PROFILES ---
 // isBoot flag prevents overwriting manual user adjustments during power recovery
+// --- PER-PUMP RUNTIME SAFETY MONITOR ---
+struct PumpSafetyTracker {
+  int pin;
+  const char* name;
+  unsigned long maxAllowedMs;
+  unsigned long activeStartTime;
+};
+
+void checkPumpRunTimeSafety() {
+  #if TESTING_MODE
+    unsigned long maxIrrig = 10000UL;
+  #else
+    unsigned long maxIrrig = (cycleDurationMins > 0 ? (cycleDurationMins * 60000UL + 30000UL) : 15000UL);
+  #endif
+
+  static PumpSafetyTracker trackers[] = {
+    { PIN_PUMP_A,        "TANK_N",     10000UL, 0 },
+    { PIN_PUMP_B,        "TANK_P",     10000UL, 0 },
+    { PIN_PUMP_C,        "TANK_K",     10000UL, 0 },
+    { PIN_PUMP_PH,       "PH_DOWN",     5000UL, 0 },
+    { PIN_PUMP_WATER,    "WATER_FILL",  WATER_TIMEOUT + 5000UL, 0 },
+    { PIN_PUMP_IRRIGATE, "IRRIGATION",  10000UL, 0 }
+  };
+  trackers[4].maxAllowedMs = WATER_TIMEOUT + 5000UL;
+  trackers[5].maxAllowedMs = maxIrrig;
+
+  unsigned long currentMillis = millis();
+
+  for (int i = 0; i < 6; i++) {
+    bool isPinActive = (digitalRead(trackers[i].pin) == PUMP_ON);
+    if (isPinActive) {
+      if (trackers[i].activeStartTime == 0) {
+        trackers[i].activeStartTime = currentMillis;
+      } else if (currentMillis - trackers[i].activeStartTime > trackers[i].maxAllowedMs) {
+        Serial.printf("EMERGENCY SAFETY CUTOFF: Pump %s exceeded max runtime (%lu ms)! Forcing shutdown.\n", 
+                      trackers[i].name, trackers[i].maxAllowedMs);
+        turnOffAllPumps();
+        dosingError = true;
+        beep(1000);
+        setRGB(1, 0, 0);
+        trackers[i].activeStartTime = 0;
+      }
+    } else {
+      trackers[i].activeStartTime = 0;
+    }
+  }
+}
+
 void loadProfileForDay(int day, bool isBoot = false) {
   if (day < 1) day = 1;
   if (day > TOTAL_DAYS) day = TOTAL_DAYS;
@@ -307,12 +370,20 @@ void loadProfileForDay(int day, bool isBoot = false) {
   }
   
   preferences.putInt("day", currentDay);
+  if (rtcAvailable && !isBoot) {
+    uint32_t newStart = getSafeRTCNow().unixtime() - (unsigned long)(currentDay - 1) * 86400UL;
+    preferences.putULong("start_epoch", newStart);
+  }
   forceDisplayUpdate = true;
 }
 
 void setup() {
   Serial.begin(115200); 
   while (!Serial) { delay(10); } // Wait for Wokwi terminal handshake
+
+  // Initialize ESP32 Task Watchdog Timer (TWDT)
+  esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
+  esp_task_wdt_add(NULL); // Subscribe Arduino loopTask
   
   Serial.println("\n--- SYSTEM BOOTING: DOSING CONTROL ACTIVE ---"); 
 
@@ -339,8 +410,10 @@ void setup() {
   // Initialize the RTC Module
   if (!rtc.begin()) {
     Serial.println("Warning: RTC module not found!");
+    rtcAvailable = false;
   } else {
     Serial.println("RTC Initialized!");
+    rtcAvailable = true;
     // If the coin cell battery is empty or new, set time to the moment you compiled the code
     if (rtc.lostPower()) {
       Serial.println("RTC lost power, setting time...");
@@ -350,21 +423,29 @@ void setup() {
   // Increase I2C Clock speed to 400kHz for faster OLED drawing
   // Wire.setClock(400000); 
 
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("OLED Failed");
-    // Notice we deleted the for(;;);
+  Wire.beginTransmission(0x3C);
+  oledAvailable = (Wire.endTransmission() == 0);
+  if (oledAvailable) {
+    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+      Serial.println("OLED Failed");
+      oledAvailable = false;
+    } else {
+      Serial.println("OLED Initialized!");
+    }
   } else {
-    oledAvailable = true;
+    Serial.println("Warning: OLED not detected at I2C 0x3C!");
   }
 
-  // Init SD Card
-  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  if (SD.begin(SD_CS)) {
-    sdInitialized = true;
-    Serial.println("SD Card Initialized");
-  } else {
-    Serial.println("SD Card Failed");
-  }
+  // Init SD Card (TESTING_MODE only)
+  #if TESTING_MODE
+    SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+    if (SD.begin(SD_CS)) {
+      sdInitialized = true;
+      Serial.println("SD Card Initialized");
+    } else {
+      Serial.println("SD Card Failed");
+    }
+  #endif
 
   tempSensor.begin();
   tempSensor.setWaitForConversion(false); 
@@ -381,7 +462,25 @@ void setup() {
   currentDay = preferences.getInt("day", 1);
   manualOverridePH = preferences.getBool("man_ovr_ph", false);
   manualOverrideEC = preferences.getBool("man_ovr_ec", false);
-  
+
+  uint32_t startEpoch = preferences.getULong("start_epoch", 0);
+  if (rtcAvailable) {
+    if (startEpoch == 0 || currentDay == 1) {
+      if (startEpoch == 0) {
+        startEpoch = getSafeRTCNow().unixtime();
+        preferences.putULong("start_epoch", startEpoch);
+      }
+    }
+  #if !TESTING_MODE
+    uint32_t nowEpoch = getSafeRTCNow().unixtime();
+    if (startEpoch > 0 && nowEpoch >= startEpoch) {
+      int calculatedDay = ((nowEpoch - startEpoch) / 86400UL) + 1;
+      if (calculatedDay > TOTAL_DAYS) calculatedDay = TOTAL_DAYS;
+      currentDay = calculatedDay;
+    }
+  #endif
+  }
+
   loadProfileForDay(currentDay, true); 
   
   // Recover manual user overrides if they exist; otherwise, initialize cleanly to silence errors
@@ -399,15 +498,22 @@ void setup() {
     targetEC = preferences.getFloat("target_ec");
   }
 
+  #if TESTING_MODE
   if (sdInitialized) {
-    // Write a clean CSV header that perfectly matches the telemetry and event logs
-    writeToSD("Timestamp,Day,Phase,EventType,PumpName,DurationMs,Attempt,pH(Target),EC(Target),Temp");
-    Serial.println("Timestamp,Day,Phase,EventType,PumpName,DurationMs,Attempt,pH(Target),EC(Target),Temp");  
-    Serial.println("CSV Header written to SD card.");
+    // Write CSV header only if /data.csv does not already exist
+    if (!SD.exists("/data.csv")) {
+      writeToSD("Timestamp,Day,Phase,EventType,PumpName,DurationMs,Attempt,pH,Target_pH,EC,Target_EC,TempC");
+      Serial.println("CSV Header written to SD card.");
+    }
+    Serial.println("Timestamp,Day,Phase,EventType,PumpName,DurationMs,Attempt,pH,Target_pH,EC,Target_EC,TempC");
   }
+  #endif
 }
 
 void loop() {
+  esp_task_wdt_reset(); // Feed Task Watchdog
+  checkPumpRunTimeSafety(); // Independent maximum pump on-time safety cutoff
+
   systemActive = (digitalRead(PIN_SW_POWER) == LOW); 
 
   if (!systemActive) {
@@ -427,7 +533,7 @@ void loop() {
       logDumped = true; 
     }
     
-    if (millis() - lastDisplayUpdate > 500) {
+    if (oledAvailable && (millis() - lastDisplayUpdate > 500)) {
       display.clearDisplay();
       display.setTextSize(2);
       display.setTextColor(SSD1306_WHITE);
@@ -446,19 +552,20 @@ void loop() {
   handleIrrigation();
 
   #if !TESTING_MODE
-    // PRODUCTION: Automatic 24-Hour Day Advancement via RTC Midnight Rollover
-    static int lastRecordedDate = -1;
-    DateTime now = rtc.now();
-    
-    if (lastRecordedDate == -1) {
-      lastRecordedDate = now.day(); // Initialize on first loop
-    }
-    
-    // When the physical day of the month changes (Midnight)
-    if (now.day() != lastRecordedDate) {
-      lastRecordedDate = now.day();
-      if (currentDay < TOTAL_DAYS) {
-        loadProfileForDay(currentDay + 1); 
+    // PRODUCTION: Automatic 24-Hour Day Advancement via RTC start_epoch timestamp
+    if (rtcAvailable) {
+      uint32_t startEpoch = preferences.getULong("start_epoch", 0);
+      if (startEpoch == 0) {
+        startEpoch = getSafeRTCNow().unixtime();
+        preferences.putULong("start_epoch", startEpoch);
+      }
+      DateTime now = getSafeRTCNow();
+      if (now.unixtime() >= startEpoch) {
+        int calculatedDay = ((now.unixtime() - startEpoch) / 86400UL) + 1;
+        if (calculatedDay > TOTAL_DAYS) calculatedDay = TOTAL_DAYS;
+        if (calculatedDay != currentDay) {
+          loadProfileForDay(calculatedDay); 
+        }
       }
     }
   #endif
@@ -554,19 +661,25 @@ void processInputs() {
   if (millis() - lastTempReq >= 2000) {
     float tempC = tempSensor.getTempCByIndex(0);
     
-    // The Dallas library returns -127.0 if the sensor is disconnected
-    if (tempC <= -100.0) {
-      tempValid = false; // Sensor is dead/unplugged. Force safety shutdown immediately!
+    // The Dallas library returns -127.0 if the sensor is disconnected, 85.0 is power-on error state
+    if (tempC <= -100.0 || tempC >= 85.0) {
+      tempSensorConnected = false; // Sensor unplugged or dead
     } else {
-      // 85.0 is a power-on error state, so we ignore it, otherwise update currentTemp
-      if (tempC < 85.0) currentTemp = tempC; 
-      
-      // Standard Temperature Guard check (lowered to 24C per agronomy review)
-      tempValid = (currentTemp >= 15.0 && currentTemp <= 24.0); 
+      tempSensorConnected = true;
+      currentTemp = tempC;
     }
+    
+    tempHighAlarm = (tempSensorConnected && currentTemp > 24.0);
     
     tempSensor.requestTemperatures(); // Request next reading asynchronously 
     lastTempReq = millis();
+  }
+
+  // Audio warning for high water temperature (intermittent chirp without blocking)
+  static unsigned long lastHighTempBeep = 0;
+  if (tempHighAlarm && (millis() - lastHighTempBeep >= 10000)) {
+    beep(100);
+    lastHighTempBeep = millis();
   }
 }
 
@@ -602,7 +715,7 @@ void processSequentialDosing() {
   else if (currentDosingState == DOSE_WATER) setRGB(0, 0, 1); // BLUE = Fill
   else setRGB(1, 1, 0); // YELLOW = Mixing/Dosing
 
-  static int floatReadCount = 0;
+  static unsigned long floatFullStartTime = 0;
 
   switch (currentDosingState) {
     case IDLE:
@@ -615,8 +728,8 @@ void processSequentialDosing() {
         currentDosingState = DOSE_WATER;
         waterFillTimer = millis();
       }
-      else if (!tempValid) {
-        // Temperature Guard Active - Prevent dosing
+      else if (!tempSensorConnected) {
+        // Temperature sensor disconnected - Prevent dosing for safety
       }
       else if (!isCurrentlyFlushing && currentEC < (targetEC - EC_DEADBAND)) {
         #if !TESTING_MODE
@@ -640,7 +753,7 @@ void processSequentialDosing() {
           logPulseEvent("TANK_N", durA, dosingAttempts, true); // EVENT LOG
         }
       }
-      else if (currentpH > (targetpH + PH_DEADBAND)) {
+      else if (!isCurrentlyFlushing && targetEC > 0.0 && currentpH > (targetpH + PH_DEADBAND)) {
         if (dosingAttempts >= MAX_DOSING_ATTEMPTS) dosingError = true;
         else { 
           currentDosingState = DOSE_PH; 
@@ -649,7 +762,8 @@ void processSequentialDosing() {
           logPulseEvent("PH_DOWN", PUMP_PULSE_PH, dosingAttempts, true); // EVENT LOG
         }
       } 
-      else if ((isCurrentlyFlushing || currentEC >= (targetEC - EC_DEADBAND)) && currentpH <= (targetpH + PH_DEADBAND)) {
+      else if ((isCurrentlyFlushing || currentEC >= (targetEC - EC_DEADBAND)) && 
+               (isCurrentlyFlushing || targetEC == 0.0 || currentpH <= (targetpH + PH_DEADBAND))) {
         dosingAttempts = 0; 
       }
       break;
@@ -661,20 +775,22 @@ void processSequentialDosing() {
         dosingError = true;
         beep(1000); 
         currentDosingState = IDLE;
+        floatFullStartTime = 0;
         break;
       }
       
       digitalWrite(PIN_PUMP_WATER, PUMP_ON);
       
       if (digitalRead(PIN_SW_FLOAT) == TANK_FULL) {
-        floatReadCount++;
-        if (floatReadCount > 10) { 
+        if (floatFullStartTime == 0) {
+          floatFullStartTime = millis();
+        } else if (millis() - floatFullStartTime >= 2000) {
           digitalWrite(PIN_PUMP_WATER, PUMP_OFF);
           currentDosingState = IDLE;
-          floatReadCount = 0;
+          floatFullStartTime = 0;
         }
       } else {
-        floatReadCount = 0;
+        floatFullStartTime = 0;
       }
       break;
 
@@ -784,12 +900,13 @@ void handleIrrigation() {
   if (!systemActive || dailyCycles == 0 || cycleDurationMins == 0 || tankEmptyISRFlag || activelyFixingChemistry || toxicBurnRisk) {
     if (isIrrigating) {
       digitalWrite(PIN_PUMP_IRRIGATE, PUMP_OFF);
-      DateTime now = rtc.now();
+      DateTime now = getSafeRTCNow();
       char logBuf[160];
-      snprintf(logBuf, sizeof(logBuf), "%04d-%02d-%02d %02d:%02d:%02d,DAY_%d,%s,PULSE_OFF,IRRIGATION_ABORT,%lu,1,pH:%.2f(T:%.2f),EC:%.2f(T:%.2f),Temp:%.1fC",
+      snprintf(logBuf, sizeof(logBuf), "%04d-%02d-%02d %02d:%02d:%02d,%d,%s,PULSE_OFF,IRRIGATION_ABORT,%lu,1,%.2f,%.2f,%.2f,%.2f,%.1f",
                now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second(), 
                currentDay, currentPhaseName.c_str(), 0UL, currentpH, targetpH, currentEC, targetEC, currentTemp);
       Serial.println(logBuf);
+      writeToSD(String(logBuf));
       
       isIrrigating = false;
       // Defect 1.6: Refund the aborted cycle so the plants get their full watering when the fault clears
@@ -812,12 +929,13 @@ void handleIrrigation() {
           loadProfileForDay(currentDay + 1);
           
           // Log the automated day transition
-          DateTime now = rtc.now();
+          DateTime now = getSafeRTCNow();
           char logBuf[160];
-          snprintf(logBuf, sizeof(logBuf), "%04d-%02d-%02d %02d:%02d:%02d,DAY_%d,%s,TEST_DAY_ADVANCE,NONE,0,0,pH:%.2f(T:%.2f),EC:%.2f(T:%.2f),Temp:%.1fC",
+          snprintf(logBuf, sizeof(logBuf), "%04d-%02d-%02d %02d:%02d:%02d,%d,%s,TEST_DAY_ADVANCE,NONE,0,0,%.2f,%.2f,%.2f,%.2f,%.1f",
                    now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second(), 
                    currentDay, currentPhaseName.c_str(), currentpH, targetpH, currentEC, targetEC, currentTemp);
           Serial.println(logBuf);
+          writeToSD(String(logBuf));
         }
       }
     #endif
@@ -873,6 +991,7 @@ void handleIrrigation() {
              now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second(), 
              currentDay, currentPhaseName.c_str(), currentCycleIndex, dailyCycles, durationMs, currentpH, targetpH, currentEC, targetEC, currentTemp);
     Serial.println(logBuf);
+    writeToSD(String(logBuf));
     forceDisplayUpdate = true;
   }
 }
@@ -887,7 +1006,7 @@ void updateDisplay() {
   display.print("D"); display.print(currentDay); display.print(":");
   display.print(currentPhaseName);
   
-  if (isCurrentlyFlushing) {
+  if (isCurrentlyFlushing && currentPhaseName != "Germination") {
     display.setCursor(85, 0);
     display.print("[FLUSH]");
   }
@@ -923,6 +1042,7 @@ void updateDisplay() {
   // Bottom Row 1: Temp & Irrigation Status
   display.setCursor(2, 48);
   display.print(currentTemp, 1); display.print("C");
+  if (tempHighAlarm) display.print("!");
 
   display.setCursor(55, 48);
   if (isIrrigating) {
@@ -937,10 +1057,12 @@ void updateDisplay() {
     display.print("ERR: PUMP LOCKOUT!");
   } else if (waterTimeoutError) {
     display.print("ERR: FILL TIMEOUT!");
-  } else if (!tempValid) {
-    display.print("ERR: TEMP LIMIT MET!");
+  } else if (!tempSensorConnected) {
+    display.print("ERR: TEMP SENSOR!");
   } else if (tankEmptyISRFlag) {
     display.print("ERR: TANK EMPTY!");
+  } else if (tempHighAlarm && !isIrrigating && currentDosingState == IDLE) {
+    display.print("WARN: HIGH TEMP >24C");
   } else if (isIrrigating) {
     unsigned long elapsedSecs = (millis() - lastIrrigationStart) / 1000UL;
     #if TESTING_MODE
