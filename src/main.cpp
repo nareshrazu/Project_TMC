@@ -115,10 +115,9 @@ bool oledAvailable = false;
 bool manualOverridePH = false;
 bool manualOverrideEC = false;
 
-float targetpH = 6.0, targetEC = 2.0;
+float targetpH = 6.0, targetEC = 0.0;
 unsigned long durA = 1000, durB = 1000, durC = 1000;
 float currentpH = 7.0, currentEC = 0.0, currentTemp = 24.0;
-bool tempValid = true; // Temperature Guard Flag
 bool tempSensorConnected = true;
 bool tempHighAlarm = false;
 
@@ -221,7 +220,7 @@ void logPulseEvent(const char* pumpName, unsigned long durationMs, int attempt, 
   DateTime now = getSafeRTCNow(); // Grab the exact time the event occurred
   
   char logBuf[160];
-  snprintf(logBuf, sizeof(logBuf), "%04d-%02d-%02d %02d:%02d:%02d,%d,%s,%s,%s,%lu,%d,%.2f,%.2f,%.2f,%.2f,%.1f",
+  snprintf(logBuf, sizeof(logBuf), "%04d-%02d-%02d %02d:%02d:%02d,DAY_%d,%s,%s,%s,%lu,%d,%.2f,%.2f,%.2f,%.2f,%.1f",
            now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second(),
            currentDay, currentPhaseName.c_str(), starting ? "PULSE_ON" : "PULSE_OFF", 
            pumpName, durationMs, attempt, currentpH, targetpH, currentEC, targetEC, currentTemp);
@@ -260,7 +259,7 @@ void streamTelemetryMetrics() {
     }
     
     char metricBuf[160];
-    snprintf(metricBuf, sizeof(metricBuf), "%04d-%02d-%02d %02d:%02d:%02d,%d,%s,%s,%s,0,0,%.2f,%.2f,%.2f,%.2f,%.1f",
+    snprintf(metricBuf, sizeof(metricBuf), "%04d-%02d-%02d %02d:%02d:%02d,DAY_%d,%s,%s,%s,0,0,%.2f,%.2f,%.2f,%.2f,%.1f",
              now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second(),
              currentDay, currentPhaseName.c_str(), evtType, pumpName, currentpH, targetpH, currentEC, targetEC, currentTemp);
              
@@ -366,6 +365,7 @@ void loadProfileForDay(int day, bool isBoot = false) {
       isIrrigating = false;
     }
     currentCycleIndex = 0;
+    preferences.putInt("cycle_idx", 0);
     lastIrrigationStart = millis();
   }
   
@@ -460,23 +460,26 @@ void setup() {
   #endif
   
   currentDay = preferences.getInt("day", 1);
+  currentCycleIndex = preferences.getInt("cycle_idx", 0);
   manualOverridePH = preferences.getBool("man_ovr_ph", false);
   manualOverrideEC = preferences.getBool("man_ovr_ec", false);
 
   uint32_t startEpoch = preferences.getULong("start_epoch", 0);
   if (rtcAvailable) {
-    if (startEpoch == 0 || currentDay == 1) {
-      if (startEpoch == 0) {
-        startEpoch = getSafeRTCNow().unixtime();
-        preferences.putULong("start_epoch", startEpoch);
-      }
+    if (startEpoch == 0) {
+      startEpoch = getSafeRTCNow().unixtime();
+      preferences.putULong("start_epoch", startEpoch);
     }
   #if !TESTING_MODE
     uint32_t nowEpoch = getSafeRTCNow().unixtime();
     if (startEpoch > 0 && nowEpoch >= startEpoch) {
       int calculatedDay = ((nowEpoch - startEpoch) / 86400UL) + 1;
       if (calculatedDay > TOTAL_DAYS) calculatedDay = TOTAL_DAYS;
-      currentDay = calculatedDay;
+      if (calculatedDay != currentDay) {
+        currentDay = calculatedDay;
+        currentCycleIndex = 0;
+        preferences.putInt("cycle_idx", 0);
+      }
     }
   #endif
   }
@@ -521,11 +524,9 @@ void loop() {
     setRGB(0, 0, 0); 
     currentDosingState = IDLE;
 
-    // --- ADD THESE TWO LINES ---
     dosingError = false;   // Clears the red error lockout
     waterTimeoutError = false;
     dosingAttempts = 0;    // Resets the 15-attempt counter
-    // ---------------------------
     
     // Dump SD Card logs when the system is switched off
     if (!logDumped) {
@@ -691,7 +692,6 @@ void processSequentialDosing() {
 
   if (dosingError || waterTimeoutError) {
     turnOffDosingPumps();
-    turnOffDosingPumps();
     setRGB(1, 0, 0); 
     currentDosingState = IDLE;
     return;
@@ -739,9 +739,9 @@ void processSequentialDosing() {
           float totalMl = ((targetEC - currentEC) / EC_RISE_PER_ML_L) * RESERVOIR_LITERS;
           float totalMs = (totalMl / PUMP_FLOW_ML_PER_S) * 1000.0f;
           if (totalRatio > 0) {
-            durA = (unsigned long)(totalMs * (corianderSchedule[idx].durA / totalRatio));
-            durB = (unsigned long)(totalMs * (corianderSchedule[idx].durB / totalRatio));
-            durC = (unsigned long)(totalMs * (corianderSchedule[idx].durC / totalRatio));
+            durA = constrain((unsigned long)(totalMs * (corianderSchedule[idx].durA / totalRatio)), 250UL, 8000UL);
+            durB = constrain((unsigned long)(totalMs * (corianderSchedule[idx].durB / totalRatio)), 250UL, 8000UL);
+            durC = constrain((unsigned long)(totalMs * (corianderSchedule[idx].durC / totalRatio)), 250UL, 8000UL);
           }
         #endif
 
@@ -753,7 +753,7 @@ void processSequentialDosing() {
           logPulseEvent("TANK_N", durA, dosingAttempts, true); // EVENT LOG
         }
       }
-      else if (!isCurrentlyFlushing && targetEC > 0.0 && currentpH > (targetpH + PH_DEADBAND)) {
+      else if (currentpH > (targetpH + PH_DEADBAND)) {
         if (dosingAttempts >= MAX_DOSING_ATTEMPTS) dosingError = true;
         else { 
           currentDosingState = DOSE_PH; 
@@ -763,7 +763,7 @@ void processSequentialDosing() {
         }
       } 
       else if ((isCurrentlyFlushing || currentEC >= (targetEC - EC_DEADBAND)) && 
-               (isCurrentlyFlushing || targetEC == 0.0 || currentpH <= (targetpH + PH_DEADBAND))) {
+               (currentpH <= (targetpH + PH_DEADBAND))) {
         dosingAttempts = 0; 
       }
       break;
@@ -772,7 +772,6 @@ void processSequentialDosing() {
       if (millis() - waterFillTimer > WATER_TIMEOUT) {
         turnOffAllPumps();
         waterTimeoutError = true; // Use waterTimeoutError instead of dosingError
-        dosingError = true;
         beep(1000); 
         currentDosingState = IDLE;
         floatFullStartTime = 0;
@@ -786,6 +785,7 @@ void processSequentialDosing() {
           floatFullStartTime = millis();
         } else if (millis() - floatFullStartTime >= 2000) {
           digitalWrite(PIN_PUMP_WATER, PUMP_OFF);
+          tankEmptyISRFlag = false; // Guarantee ISR flag matches verified physical pin state
           currentDosingState = IDLE;
           floatFullStartTime = 0;
         }
@@ -874,9 +874,10 @@ void processSequentialDosing() {
 
 void handleIrrigation() {
   // 1. Check if it's a NEW DAY to reset the cycle counter
-  static int lastIrrigationDay = -1;
+  static int lastIrrigationDay = currentDay;
   if (lastIrrigationDay != currentDay) {
     currentCycleIndex = 0;
+    preferences.putInt("cycle_idx", 0);
     lastIrrigationDay = currentDay;
     lastIrrigationStart = millis(); // Reset timer for the new day
   }
@@ -884,14 +885,11 @@ void handleIrrigation() {
   const float PH_DEADBAND = 0.20; 
   const float EC_DEADBAND = 0.10; 
 
-  // True if the state machine still needs another dosing attempt AND is healthy enough to dose
-  bool needsMoreDosing = (!isCurrentlyFlushing && currentEC < (targetEC - EC_DEADBAND)) || (currentpH > (targetpH + PH_DEADBAND));
-  bool canStillDose    = (!dosingError && tempValid && dosingAttempts < MAX_DOSING_ATTEMPTS);
   bool ecNeedsDosing = (!isCurrentlyFlushing && (currentEC < targetEC - EC_DEADBAND));
   bool phNeedsDosing = (currentpH > targetpH + PH_DEADBAND);
-// Hold off STARTING irrigation if chemistry needs fixing, 
+  // Hold off STARTING irrigation if chemistry needs fixing, 
   // but if already watering (!isIrrigating is false), let the current cycle finish unless a dosing pump is actually active!
-  bool activelyFixingChemistry = (!dosingError && !waterTimeoutError && tempValid && (currentDosingState != IDLE || (!isIrrigating && (ecNeedsDosing || phNeedsDosing))));
+  bool activelyFixingChemistry = (!dosingError && !waterTimeoutError && tempSensorConnected && (currentDosingState != IDLE || (!isIrrigating && (ecNeedsDosing || phNeedsDosing))));
 
   // Lethal overdose guard: block watering ONLY if water is dangerously acidic/alkaline or over-salted
   bool toxicBurnRisk = (currentpH < 4.5 || currentpH > 8.0) || (!isCurrentlyFlushing && currentEC > (targetEC + 0.80));
@@ -902,7 +900,7 @@ void handleIrrigation() {
       digitalWrite(PIN_PUMP_IRRIGATE, PUMP_OFF);
       DateTime now = getSafeRTCNow();
       char logBuf[160];
-      snprintf(logBuf, sizeof(logBuf), "%04d-%02d-%02d %02d:%02d:%02d,%d,%s,PULSE_OFF,IRRIGATION_ABORT,%lu,1,%.2f,%.2f,%.2f,%.2f,%.1f",
+      snprintf(logBuf, sizeof(logBuf), "%04d-%02d-%02d %02d:%02d:%02d,DAY_%d,%s,PULSE_OFF,IRRIGATION_ABORT,%lu,1,%.2f,%.2f,%.2f,%.2f,%.1f",
                now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second(), 
                currentDay, currentPhaseName.c_str(), 0UL, currentpH, targetpH, currentEC, targetEC, currentTemp);
       Serial.println(logBuf);
@@ -912,6 +910,7 @@ void handleIrrigation() {
       // Defect 1.6: Refund the aborted cycle so the plants get their full watering when the fault clears
       if (currentCycleIndex > 0) {
         currentCycleIndex--;
+        preferences.putInt("cycle_idx", currentCycleIndex);
       }
     }
     return;
@@ -921,7 +920,7 @@ void handleIrrigation() {
   if (currentCycleIndex >= dailyCycles && !isIrrigating) {
     
     #if TESTING_MODE
-      // Fast-forward testing: Wait 10 seconds after the final watering, then advance to tomorrow
+      // Fast-forward testing: Wait 6 seconds after the final watering, then advance to tomorrow
       if (millis() - lastIrrigationStart >= 6000) {
 
         // ONLY advance if we haven't reached the end of the crop profile yet
@@ -931,7 +930,7 @@ void handleIrrigation() {
           // Log the automated day transition
           DateTime now = getSafeRTCNow();
           char logBuf[160];
-          snprintf(logBuf, sizeof(logBuf), "%04d-%02d-%02d %02d:%02d:%02d,%d,%s,TEST_DAY_ADVANCE,NONE,0,0,%.2f,%.2f,%.2f,%.2f,%.1f",
+          snprintf(logBuf, sizeof(logBuf), "%04d-%02d-%02d %02d:%02d:%02d,DAY_%d,%s,TEST_DAY_ADVANCE,NONE,0,0,%.2f,%.2f,%.2f,%.2f,%.1f",
                    now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second(), 
                    currentDay, currentPhaseName.c_str(), currentpH, targetpH, currentEC, targetEC, currentTemp);
           Serial.println(logBuf);
@@ -951,7 +950,7 @@ void handleIrrigation() {
     bool withinLightWindow = true;
   #else
     const unsigned long LIGHT_HOURS = 12UL; // 06:00 to 18:00 daylight window
-    DateTime now = rtc.now();
+    DateTime now = getSafeRTCNow();
     bool withinLightWindow = (now.hour() >= 6 && now.hour() < 18);
 
     unsigned long durationMs = (unsigned long)cycleDurationMins * 60000UL;
@@ -967,12 +966,13 @@ void handleIrrigation() {
     digitalWrite(PIN_PUMP_IRRIGATE, PUMP_OFF);
     lastIrrigationStart = millis(); 
 
-    DateTime now = rtc.now();
+    DateTime now = getSafeRTCNow();
     char logBuf[160];
-    snprintf(logBuf, sizeof(logBuf), "%04d-%02d-%02d %02d:%02d:%02d,DAY_%d,%s,PULSE_OFF,IRRIGATION_C%d_%d,%lu,1,pH:%.2f(T:%.2f),EC:%.2f(T:%.2f),Temp:%.1fC",
+    snprintf(logBuf, sizeof(logBuf), "%04d-%02d-%02d %02d:%02d:%02d,DAY_%d,%s,PULSE_OFF,IRRIGATION_C%d_%d,%lu,1,%.2f,%.2f,%.2f,%.2f,%.1f",
              now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second(), 
              currentDay, currentPhaseName.c_str(), currentCycleIndex, dailyCycles, durationMs, currentpH, targetpH, currentEC, targetEC, currentTemp);
     Serial.println(logBuf);
+    writeToSD(String(logBuf));
     forceDisplayUpdate = true;
     return;
   }
@@ -981,13 +981,14 @@ void handleIrrigation() {
   if (!isIrrigating && withinLightWindow && (millis() - lastIrrigationStart >= effectiveIntervalMs)) {
     isIrrigating = true;
     currentCycleIndex++;
+    preferences.putInt("cycle_idx", currentCycleIndex);
     lastIrrigationStart = millis(); 
 
     digitalWrite(PIN_PUMP_IRRIGATE, PUMP_ON);
     
-    DateTime now = rtc.now();
+    DateTime now = getSafeRTCNow();
     char logBuf[160];
-    snprintf(logBuf, sizeof(logBuf), "%04d-%02d-%02d %02d:%02d:%02d,DAY_%d,%s,PULSE_ON,IRRIGATION_C%d_%d,%lu,1,pH:%.2f(T:%.2f),EC:%.2f(T:%.2f),Temp:%.1fC",
+    snprintf(logBuf, sizeof(logBuf), "%04d-%02d-%02d %02d:%02d:%02d,DAY_%d,%s,PULSE_ON,IRRIGATION_C%d_%d,%lu,1,%.2f,%.2f,%.2f,%.2f,%.1f",
              now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second(), 
              currentDay, currentPhaseName.c_str(), currentCycleIndex, dailyCycles, durationMs, currentpH, targetpH, currentEC, targetEC, currentTemp);
     Serial.println(logBuf);
