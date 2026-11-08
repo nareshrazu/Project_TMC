@@ -349,11 +349,11 @@ void loadProfileForDay(int day, bool isBoot = false) {
   }
 
   // Update targets and NVS independently so overriding pH doesn't freeze the EC schedule (and vice versa)
-  if (!isBoot && !manualOverridePH) {
+  if (!manualOverridePH) {
     targetpH = corianderSchedule[idx].targetpH;
     preferences.putFloat("target_ph", targetpH);
   }
-  if (!isBoot && !manualOverrideEC) {
+  if (!manualOverrideEC) {
     targetEC = corianderSchedule[idx].targetEC;
     preferences.putFloat("target_ec", targetEC);
   }
@@ -1007,7 +1007,7 @@ void updateDisplay() {
   display.print("D"); display.print(currentDay); display.print(":");
   display.print(currentPhaseName);
   
-  if (isCurrentlyFlushing && currentPhaseName != "Germination") {
+  if (isCurrentlyFlushing && !currentPhaseName.startsWith("Germination")) {
     display.setCursor(85, 0);
     display.print("[FLUSH]");
   }
