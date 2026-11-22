@@ -1,0 +1,623 @@
+--- a/src/main.cpp	2026-11-20 11:52:47.672413593 +0000
++++ b/src/main.cpp	2026-11-20 12:02:41.536666082 +0000
+@@ -129,6 +129,43 @@
+ int dosingAttempts = 0;
+ const int MAX_DOSING_ATTEMPTS = 15; // Reduced for safety
+ bool dosingError = false;
++const char* lockoutReason = "PUMP LOCKOUT"; // Shown on OLED as "ERR: <reason>!"
++
++// --- NUTRIENT DOSING CALIBRATION (MEASURE THESE ON YOUR HARDWARE) ---
++// PUMP_FLOW_ML_PER_S: run each pump 60 s into a measuring cylinder, divide ml by 60.
++// EC_RISE_PER_ML_L:   add 1 ml of the A:B:C mix per litre of your water, record the EC rise.
++const float RESERVOIR_LITERS          = 20.0f;
++const float PUMP_FLOW_ML_PER_S[3]     = {1.5f, 1.5f, 1.5f}; // Pump A (N), B (P), C (K)
++const float EC_RISE_PER_ML_L          = 0.25f;
++const float DOSE_FRACTION             = 0.6f;    // Dose only 60% of the computed deficit per attempt (avoid overshoot)
++const unsigned long MIN_PULSE_MS      = 250UL;
++const unsigned long MAX_PULSE_MS      = 8000UL;  // Must stay below the 10 s per-pump runtime cutoff
++const float MAX_ML_PER_PUMP_PER_DAY   = 40.0f;   // Daily cap per bottle (bottles are 100 ml). A full refill to
++                                                 // EC 1.8 needs ~49 ml/bottle at these constants -> reaches target over 2 days
++const float MIN_RESPONSE_FRACTION     = 0.3f;    // EC must rise by >=30% of the expected rise...
++const int   MAX_NO_RESPONSE_DOSES     = 2;       // ...or dosing locks out after this many doses in a row
++
++float mlUsedToday[3] = {0.0f, 0.0f, 0.0f}; // Concentrate pumped today per bottle (persisted in NVS)
++bool  doseCapReachedToday = false;         // Daily cap hit: stop EC dosing until tomorrow (no lockout)
++float ecBeforeDose = 0.0f;                 // EC at the start of the current A->B->C sequence
++float expectedEcRise = 0.0f;               // EC rise the current sequence should produce
++int   noResponseCount = 0;                 // Consecutive sequences with no meaningful EC rise
++
++// --- WATER SAFETY LIMITS ---
++// Outside the target band = alarm only (plants keep getting water).
++// Watering is blocked only beyond these absolute limits.
++const float EC_BLOCK_LIMIT   = 3.5f;
++const float PH_BLOCK_LOW     = 4.0f;
++const float PH_BLOCK_HIGH    = 8.5f;
++const float EC_ALARM_MARGIN  = 0.8f;  // Alarm when EC > target + margin
++const float PH_ALARM_LOW     = 5.0f;
++const float PH_ALARM_HIGH    = 7.5f;
++bool chemistryAlarm = false;          // Out of band but still safe to water
++bool waterBlockedUnsafe = false;      // Beyond absolute limits: watering held
++
++// --- CLOCK HEALTH ---
++bool rtcLostPowerAtBoot = false;
++bool clockWarning = false;            // RTC missing, reset, or moved backwards: check the time
+ bool waterTimeoutError = false; // Auto-clears when float switch is full!
+ bool forceDisplayUpdate = false;
+ bool systemActive = true;
+@@ -308,6 +345,7 @@
+                       trackers[i].name, trackers[i].maxAllowedMs);
+         turnOffAllPumps();
+         dosingError = true;
++        lockoutReason = "PUMP OVERRUN";
+         beep(1000);
+         setRGB(1, 0, 0);
+         trackers[i].activeStartTime = 0;
+@@ -318,6 +356,122 @@
+   }
+ }
+ 
++// --- CROP DAY CLOCK HELPERS ---
++// The DS3231 stores local time, so unixtime() % 86400 == 0 is local midnight.
++uint32_t midnightOf(uint32_t t) { return t - (t % 86400UL); }
++
++// Read the RTC twice and trust it only if the year is sane and both reads agree.
++// A corrupted I2C read decodes as e.g. year 2165 and must never move the crop day.
++bool readTrustedEpoch(uint32_t &epochOut) {
++  if (!rtcAvailable) return false;
++  DateTime a = rtc.now();
++  DateTime b = rtc.now();
++  if (a.year() < 2025 || a.year() > 2099 || b.year() < 2025 || b.year() > 2099) return false;
++  uint32_t ea = a.unixtime(), eb = b.unixtime();
++  if ((eb > ea ? eb - ea : ea - eb) > 2UL) return false;
++  epochOut = eb;
++  return true;
++}
++
++// Re-anchor start_epoch so that the date of nowEpoch counts as crop day `day` (day boundary = 00:00)
++void anchorStartEpochToDay(int day, uint32_t nowEpoch) {
++  uint32_t start = midnightOf(nowEpoch) - (uint32_t)(day - 1) * 86400UL;
++  preferences.putULong("start_epoch", start);
++}
++
++// Crop day implied by the clock, or -1 if the clock is behind the stored start date
++int dayFromEpochs(uint32_t startEpoch, uint32_t nowEpoch) {
++  if (startEpoch == 0 || nowEpoch < startEpoch) return -1;
++  int d = (int)((nowEpoch - startEpoch) / 86400UL) + 1;
++  return (d > TOTAL_DAYS) ? TOTAL_DAYS : d;
++}
++
++// --- DAILY DOSE USAGE (survives reboots, resets each crop day) ---
++void saveDoseUsage() {
++  preferences.putInt("ml_day", currentDay);
++  preferences.putBytes("ml_used", mlUsedToday, sizeof(mlUsedToday));
++}
++
++// Count concentrate actually pumped and save immediately, so a reboot mid-sequence
++// can't hand out a fresh allowance
++void recordPulse(int pump, unsigned long onMs) {
++  mlUsedToday[pump] += (onMs / 1000.0f) * PUMP_FLOW_ML_PER_S[pump];
++  saveDoseUsage();
++}
++
++// A nutrient pulse cut short (tank empty, overrun cutoff, power switch): count what was delivered
++void accountInterruptedPulse() {
++  unsigned long on = millis() - dosingTimer;
++  if (currentDosingState == DOSE_A)      recordPulse(0, on < durA ? on : durA);
++  else if (currentDosingState == DOSE_B) recordPulse(1, on < durB ? on : durB);
++  else if (currentDosingState == DOSE_C) recordPulse(2, on < durC ? on : durC);
++}
++
++void loadDoseUsage() {
++  if (preferences.getInt("ml_day", -1) == currentDay &&
++      preferences.getBytes("ml_used", mlUsedToday, sizeof(mlUsedToday)) == sizeof(mlUsedToday)) {
++    for (int i = 0; i < 3; i++) {
++      if (mlUsedToday[i] >= MAX_ML_PER_PUMP_PER_DAY - 0.05f) doseCapReachedToday = true;
++    }
++  } else {
++    for (int i = 0; i < 3; i++) mlUsedToday[i] = 0.0f;
++    doseCapReachedToday = false;
++  }
++}
++
++// Plan pulse lengths for one A->B->C sequence.
++// - Doses DOSE_FRACTION of the EC deficit, split by the profile's A:B:C ratio
++// - Scales all three pumps together so the ratio survives the daily cap and the pulse limits
++// Returns false if the daily cap leaves no room (EC dosing pauses until tomorrow).
++bool planNutrientDose() {
++  int idx = currentDay - 1;
++  float ratio[3] = { (float)corianderSchedule[idx].durA,
++                     (float)corianderSchedule[idx].durB,
++                     (float)corianderSchedule[idx].durC };
++  float ratioSum = ratio[0] + ratio[1] + ratio[2];
++  float deficit = targetEC - currentEC;
++  if (ratioSum <= 0.0f || deficit <= 0.0f) return false;
++
++  float totalMl = (deficit / EC_RISE_PER_ML_L) * RESERVOIR_LITERS * DOSE_FRACTION;
++  float ml[3], ms[3];
++  float scale = 1.0f;
++  for (int i = 0; i < 3; i++) {
++    ml[i] = totalMl * (ratio[i] / ratioSum);
++    if (ml[i] > 0.0f) {
++      float room = MAX_ML_PER_PUMP_PER_DAY - mlUsedToday[i];
++      if (room <= 0.05f) return false;              // This bottle's daily allowance is used up
++      if (room / ml[i] < scale) scale = room / ml[i];
++    }
++  }
++
++  float maxMs = 0.0f, minMs = 0.0f;
++  for (int i = 0; i < 3; i++) {
++    ms[i] = (ml[i] * scale / PUMP_FLOW_ML_PER_S[i]) * 1000.0f;
++    if (ms[i] > maxMs) maxMs = ms[i];
++    if (ms[i] > 0.0f && (minMs == 0.0f || ms[i] < minMs)) minMs = ms[i];
++  }
++  if (maxMs <= 0.0f) return false;
++
++  // Ratio-preserving limits: shrink everything if the longest pulse is too long,
++  // grow everything if the shortest pulse is too short for the pump to deliver reliably.
++  float k = 1.0f;
++  if (maxMs > (float)MAX_PULSE_MS) k = (float)MAX_PULSE_MS / maxMs;
++  else if (minMs < (float)MIN_PULSE_MS) k = (float)MIN_PULSE_MS / minMs;
++
++  unsigned long out[3];
++  expectedEcRise = 0.0f;
++  for (int i = 0; i < 3; i++) {
++    float v = ms[i] * k;
++    if (v > (float)MAX_PULSE_MS) v = (float)MAX_PULSE_MS; // Only reachable with extreme ratios (>32:1)
++    float roomMs = ((MAX_ML_PER_PUMP_PER_DAY - mlUsedToday[i]) / PUMP_FLOW_ML_PER_S[i]) * 1000.0f;
++    if (v > roomMs) v = (roomMs > 0.0f) ? roomMs : 0.0f;  // Min-pulse stretch must not break the daily cap
++    out[i] = (unsigned long)v;
++    expectedEcRise += ((v / 1000.0f) * PUMP_FLOW_ML_PER_S[i] / RESERVOIR_LITERS) * EC_RISE_PER_ML_L;
++  }
++  durA = out[0]; durB = out[1]; durC = out[2];
++  return true;
++}
++
+ void loadProfileForDay(int day, bool isBoot = false) {
+   if (day < 1) day = 1;
+   if (day > TOTAL_DAYS) day = TOTAL_DAYS;
+@@ -330,23 +484,9 @@
+   cycleDurationMins = corianderSchedule[idx].irrigationMins;
+   currentPhaseName = corianderSchedule[idx].phaseName;
+ 
+-  if (!isCurrentlyFlushing) {
+-    durA = corianderSchedule[idx].durA;
+-    durB = corianderSchedule[idx].durB;
+-    durC = corianderSchedule[idx].durC;
+-
+-    // --- NEW TESTING OVERRIDE ---
+-    #if TESTING_MODE
+-      // Force 2-second runs so the 1-second telemetry always logs "DOSING"
+-      if (durA > 0) durA = 2000;
+-      if (durB > 0) durB = 2000;
+-      if (durC > 0) durC = 2000;
+-    #endif
+-    // ----------------------------
+-
+-  } else {
+-    durA = 0; durB = 0; durC = 0;
+-  }
++  // NOTE: the profile's durA/durB/durC are now used only as the A:B:C RATIO.
++  // planNutrientDose() computes the actual pulse lengths (TESTING and production) from the
++  // EC deficit, reservoir volume and pump calibration, so they are not copied here.
+ 
+   // Update targets and NVS independently so overriding pH doesn't freeze the EC schedule (and vice versa)
+   if (!manualOverridePH) {
+@@ -367,12 +507,21 @@
+     currentCycleIndex = 0;
+     preferences.putInt("cycle_idx", 0);
+     lastIrrigationStart = millis();
++
++    // New crop day: fresh daily dose allowance
++    for (int i = 0; i < 3; i++) mlUsedToday[i] = 0.0f;
++    doseCapReachedToday = false;
++    noResponseCount = 0;
++    dosingAttempts = 0;
+   }
+-  
++
+   preferences.putInt("day", currentDay);
+-  if (rtcAvailable && !isBoot) {
+-    uint32_t newStart = getSafeRTCNow().unixtime() - (unsigned long)(currentDay - 1) * 86400UL;
+-    preferences.putULong("start_epoch", newStart);
++  if (!isBoot) {
++    saveDoseUsage();
++    // Keep the day boundary at local midnight (no-op for clock-driven transitions,
++    // re-anchors for button day jumps)
++    uint32_t nowEpoch;
++    if (readTrustedEpoch(nowEpoch)) anchorStartEpochToDay(currentDay, nowEpoch);
+   }
+   forceDisplayUpdate = true;
+ }
+@@ -418,8 +567,10 @@
+     if (rtc.lostPower()) {
+       Serial.println("RTC lost power, setting time...");
+       rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
++      rtcLostPowerAtBoot = true; // Clock is now wrong: keep the saved crop day, don't trust elapsed time
+     }
+   }
++  if (!rtcAvailable) clockWarning = true;
+   // Increase I2C Clock speed to 400kHz for faster OLED drawing
+   // Wire.setClock(400000); 
+ 
+@@ -465,26 +616,42 @@
+   manualOverrideEC = preferences.getBool("man_ovr_ec", false);
+ 
+   uint32_t startEpoch = preferences.getULong("start_epoch", 0);
+-  if (rtcAvailable) {
++  uint32_t nowEpoch = 0;
++  bool clockTrusted = readTrustedEpoch(nowEpoch);
++  if (rtcAvailable && !clockTrusted) {
++    clockWarning = true;
++    Serial.println("WARNING: RTC returned an implausible time - keeping saved crop day.");
++  }
++  if (clockTrusted) {
+     if (startEpoch == 0) {
+-      startEpoch = getSafeRTCNow().unixtime();
+-      preferences.putULong("start_epoch", startEpoch);
+-    }
+-  #if !TESTING_MODE
+-    uint32_t nowEpoch = getSafeRTCNow().unixtime();
+-    if (startEpoch > 0 && nowEpoch >= startEpoch) {
+-      int calculatedDay = ((nowEpoch - startEpoch) / 86400UL) + 1;
+-      if (calculatedDay > TOTAL_DAYS) calculatedDay = TOTAL_DAYS;
+-      if (calculatedDay != currentDay) {
++      // First boot of this crop: today (from 00:00) is the saved day
++      anchorStartEpochToDay(currentDay, nowEpoch);
++    } else if (rtcLostPowerAtBoot || nowEpoch < startEpoch) {
++      // RTC was reset (dead coin cell) or moved backwards: elapsed time is unknown.
++      // Keep the saved day instead of restarting the crop, and flag the clock.
++      clockWarning = true;
++      Serial.println("WARNING: RTC time not trustworthy - keeping saved crop day. Set the clock.");
++      anchorStartEpochToDay(currentDay, nowEpoch);
++    } else {
++    #if !TESTING_MODE
++      // Catch up on days that passed while powered off. Never move the crop backwards.
++      int calculatedDay = dayFromEpochs(startEpoch, nowEpoch);
++      if (calculatedDay > currentDay) {
+         currentDay = calculatedDay;
+         currentCycleIndex = 0;
+         preferences.putInt("cycle_idx", 0);
++      } else if (calculatedDay < currentDay) {
++        clockWarning = true;
+       }
++    #endif
++      // (Re)align to local midnight. Also migrates older firmware's start_epoch (crop start
++      // moment) without skipping a day.
++      anchorStartEpochToDay(currentDay, nowEpoch);
+     }
+-  #endif
+   }
+ 
+-  loadProfileForDay(currentDay, true); 
++  loadProfileForDay(currentDay, true);
++  loadDoseUsage(); // Restore today's dose allowance (resets if the crop day changed)
+   
+   // Recover manual user overrides if they exist; otherwise, initialize cleanly to silence errors
+   if (!preferences.isKey("target_ph")) {
+@@ -500,6 +667,9 @@
+   if (manualOverrideEC) {
+     targetEC = preferences.getFloat("target_ec");
+   }
++  // Saved targets from older firmware may be outside the new safe limits
++  targetpH = constrain(targetpH, PH_ALARM_LOW, PH_ALARM_HIGH);
++  targetEC = constrain(targetEC, 0.0f, 3.0f);
+ 
+   #if TESTING_MODE
+   if (sdInitialized) {
+@@ -520,13 +690,16 @@
+   systemActive = (digitalRead(PIN_SW_POWER) == LOW); 
+ 
+   if (!systemActive) {
++    accountInterruptedPulse();   // no-op unless switched off mid-pulse
+     turnOffAllPumps();
+     setRGB(0, 0, 0); 
+     currentDosingState = IDLE;
+ 
+     dosingError = false;   // Clears the red error lockout
++    lockoutReason = "PUMP LOCKOUT";
+     waterTimeoutError = false;
+     dosingAttempts = 0;    // Resets the 15-attempt counter
++    noResponseCount = 0;   // Operator has checked the probe/bottles
+     
+     // Dump SD Card logs when the system is switched off
+     if (!logDumped) {
+@@ -553,19 +726,48 @@
+   handleIrrigation();
+ 
+   #if !TESTING_MODE
+-    // PRODUCTION: Automatic 24-Hour Day Advancement via RTC start_epoch timestamp
+-    if (rtcAvailable) {
+-      uint32_t startEpoch = preferences.getULong("start_epoch", 0);
+-      if (startEpoch == 0) {
+-        startEpoch = getSafeRTCNow().unixtime();
+-        preferences.putULong("start_epoch", startEpoch);
+-      }
+-      DateTime now = getSafeRTCNow();
+-      if (now.unixtime() >= startEpoch) {
+-        int calculatedDay = ((now.unixtime() - startEpoch) / 86400UL) + 1;
+-        if (calculatedDay > TOTAL_DAYS) calculatedDay = TOTAL_DAYS;
+-        if (calculatedDay != currentDay) {
+-          loadProfileForDay(calculatedDay); 
++    // PRODUCTION: crop day advances at local midnight (start_epoch is midnight-aligned).
++    // Checked once per second rather than every loop pass.
++    static unsigned long lastClockCheck = 0;
++    static unsigned long noRtcDayStart = millis();
++    static int forwardJumpConfirm = 0;   // Multi-day jumps must be seen on 10 checks in a row
++    static int backwardConfirm = 0;      // ...and so must a clock that went backwards
++    static int untrustedReads = 0;
++    if (millis() - lastClockCheck >= 1000UL) {
++      lastClockCheck = millis();
++      if (rtcAvailable) {
++        uint32_t nowEpoch;
++        if (!readTrustedEpoch(nowEpoch)) {
++          if (++untrustedReads >= 60) clockWarning = true;   // ~1 minute of bad reads
++        } else {
++          untrustedReads = 0;
++          int calculatedDay = dayFromEpochs(preferences.getULong("start_epoch", 0), nowEpoch);
++          bool normalRollover = (calculatedDay == currentDay + 1);
++          bool confirmedJump  = (calculatedDay > currentDay + 1) && (++forwardJumpConfirm >= 10);
++          if (calculatedDay <= currentDay + 1) forwardJumpConfirm = 0;
++
++          if ((normalRollover || confirmedJump) && currentDosingState == IDLE) {
++            // Wait for any A->B->C sequence to finish so its accounting stays on one day
++            if (confirmedJump) clockWarning = true;
++            forwardJumpConfirm = 0;
++            loadProfileForDay(calculatedDay);
++          } else if (calculatedDay < currentDay) {
++            // Clock moved backwards while running (or start_epoch missing): never rewind the crop.
++            // Re-anchor only after 10 consistent reads, so one plausible-but-wrong read can't
++            // shift start_epoch and fake a forward jump later.
++            if (++backwardConfirm >= 10) {
++              backwardConfirm = 0;
++              clockWarning = true;
++              anchorStartEpochToDay(currentDay, nowEpoch);
++            }
++          }
++          if (calculatedDay >= currentDay) backwardConfirm = 0;
++        }
++      } else if (millis() - noRtcDayStart >= MILLIS_PER_DAY) {
++        // No RTC: advance one crop day per 24 h of uptime (days spent powered off are lost)
++        if (currentDosingState == IDLE) {   // finish any A->B->C sequence first
++          noRtcDayStart += MILLIS_PER_DAY;
++          if (currentDay < TOTAL_DAYS) loadProfileForDay(currentDay + 1);
+         }
+       }
+     }
+@@ -594,7 +796,7 @@
+         switch(i) {
+           case 0: // PIN_BTN_TGT_PH_UP
+             targetpH += 0.05; 
+-            if (targetpH > 8.0) targetpH = 8.0; 
++            if (targetpH > PH_ALARM_HIGH) targetpH = PH_ALARM_HIGH; // Stay inside the safe band
+             manualOverridePH = true;
+             preferences.putBool("man_ovr_ph", true);
+             preferences.putFloat("target_ph", targetpH); 
+@@ -602,7 +804,7 @@
+             
+           case 1: // PIN_BTN_TGT_PH_DN
+             targetpH -= 0.05; 
+-            if (targetpH < 4.0) targetpH = 4.0; 
++            if (targetpH < PH_ALARM_LOW) targetpH = PH_ALARM_LOW; 
+             manualOverridePH = true;
+             preferences.putBool("man_ovr_ph", true);
+             preferences.putFloat("target_ph", targetpH); 
+@@ -610,7 +812,7 @@
+             
+           case 2: // PIN_BTN_TGT_EC_UP
+             targetEC += 0.1;  
+-            if (targetEC > 4.0) targetEC = 4.0; 
++            if (targetEC > 3.0) targetEC = 3.0; // Below EC_BLOCK_LIMIT so dosing can't block watering
+             manualOverrideEC = true;
+             preferences.putBool("man_ovr_ec", true);
+             preferences.putFloat("target_ec", targetEC); 
+@@ -678,7 +880,7 @@
+ 
+   // Audio warning for high water temperature (intermittent chirp without blocking)
+   static unsigned long lastHighTempBeep = 0;
+-  if (tempHighAlarm && (millis() - lastHighTempBeep >= 10000)) {
++  if ((tempHighAlarm || chemistryAlarm || waterBlockedUnsafe) && (millis() - lastHighTempBeep >= 10000)) {
+     beep(100);
+     lastHighTempBeep = millis();
+   }
+@@ -691,6 +893,7 @@
+   }
+ 
+   if (dosingError || waterTimeoutError) {
++    accountInterruptedPulse();   // e.g. overrun cutoff mid-pulse (no-op once IDLE)
+     turnOffDosingPumps();
+     setRGB(1, 0, 0); 
+     currentDosingState = IDLE;
+@@ -699,6 +902,7 @@
+ 
+   // Safety Abort
+   if (tankEmptyISRFlag && currentDosingState != IDLE && currentDosingState != DOSE_WATER) {
++    accountInterruptedPulse();
+     turnOffAllPumps();
+     currentDosingState = IDLE;
+     return;
+@@ -706,9 +910,6 @@
+ 
+   const float PH_DEADBAND = 0.20; 
+   const float EC_DEADBAND = 0.10; // Tightened deadband
+-  const float RESERVOIR_LITERS   = 20.0f;
+-  const float PUMP_FLOW_ML_PER_S = 1.5f;
+-  const float EC_RISE_PER_ML_L   = 0.25f;
+ 
+   if (tankEmptyISRFlag) setRGB(1, 0, 0); // RED = Empty Alert
+   else if (currentDosingState == IDLE) setRGB(0, 1, 0); // GREEN = Nominal
+@@ -731,30 +932,31 @@
+       else if (!tempSensorConnected) {
+         // Temperature sensor disconnected - Prevent dosing for safety
+       }
+-      else if (!isCurrentlyFlushing && currentEC < (targetEC - EC_DEADBAND)) {
+-        #if !TESTING_MODE
+-          // Defect 1.7: Scale pulse durations proportionally to EC deficit and reservoir volume
+-          int idx = currentDay - 1;
+-          float totalRatio = corianderSchedule[idx].durA + corianderSchedule[idx].durB + corianderSchedule[idx].durC;
+-          float totalMl = ((targetEC - currentEC) / EC_RISE_PER_ML_L) * RESERVOIR_LITERS;
+-          float totalMs = (totalMl / PUMP_FLOW_ML_PER_S) * 1000.0f;
+-          if (totalRatio > 0) {
+-            durA = constrain((unsigned long)(totalMs * (corianderSchedule[idx].durA / totalRatio)), 250UL, 8000UL);
+-            durB = constrain((unsigned long)(totalMs * (corianderSchedule[idx].durB / totalRatio)), 250UL, 8000UL);
+-            durC = constrain((unsigned long)(totalMs * (corianderSchedule[idx].durC / totalRatio)), 250UL, 8000UL);
+-          }
+-        #endif
+-
+-        if (dosingAttempts >= MAX_DOSING_ATTEMPTS) dosingError = true;
+-        else { 
+-          currentDosingState = DOSE_A; 
+-          dosingTimer = millis(); 
+-          dosingAttempts++; 
++      else if (!isCurrentlyFlushing && !doseCapReachedToday && currentEC < (targetEC - EC_DEADBAND)) {
++        if (dosingAttempts >= MAX_DOSING_ATTEMPTS) {
++          dosingError = true;
++          lockoutReason = "PUMP LOCKOUT";
++        }
++        else if (!planNutrientDose()) {
++          // Daily per-bottle allowance used up: pause EC dosing until the next crop day (no lockout,
++          // watering continues). Repeated hits point at a probe or calibration problem.
++          doseCapReachedToday = true;
++          Serial.println("WARNING: Daily nutrient dose cap reached - EC dosing paused until tomorrow.");
++          forceDisplayUpdate = true;
++        }
++        else {
++          ecBeforeDose = currentEC;
++          currentDosingState = DOSE_A;
++          dosingTimer = millis();
++          dosingAttempts++;
+           logPulseEvent("TANK_N", durA, dosingAttempts, true); // EVENT LOG
+         }
+       }
+       else if (currentpH > (targetpH + PH_DEADBAND)) {
+-        if (dosingAttempts >= MAX_DOSING_ATTEMPTS) dosingError = true;
++        if (dosingAttempts >= MAX_DOSING_ATTEMPTS) {
++          dosingError = true;
++          lockoutReason = "PUMP LOCKOUT";
++        }
+         else { 
+           currentDosingState = DOSE_PH; 
+           dosingTimer = millis(); 
+@@ -762,7 +964,7 @@
+           logPulseEvent("PH_DOWN", PUMP_PULSE_PH, dosingAttempts, true); // EVENT LOG
+         }
+       } 
+-      else if ((isCurrentlyFlushing || currentEC >= (targetEC - EC_DEADBAND)) && 
++      else if ((isCurrentlyFlushing || doseCapReachedToday || currentEC >= (targetEC - EC_DEADBAND)) && 
+                (currentpH <= (targetpH + PH_DEADBAND))) {
+         dosingAttempts = 0; 
+       }
+@@ -798,6 +1000,7 @@
+       digitalWrite(PIN_PUMP_A, PUMP_ON);
+       if (millis() - dosingTimer >= durA) {
+         digitalWrite(PIN_PUMP_A, PUMP_OFF);
++        recordPulse(0, durA);
+         logPulseEvent("TANK_N", durA, dosingAttempts, false); // EVENT LOG
+         #if TESTING_MODE
+           currentEC += 0.1; 
+@@ -819,6 +1022,7 @@
+       digitalWrite(PIN_PUMP_B, PUMP_ON);
+       if (millis() - dosingTimer >= durB) {
+         digitalWrite(PIN_PUMP_B, PUMP_OFF);
++        recordPulse(1, durB);
+         logPulseEvent("TANK_P", durB, dosingAttempts, false); // EVENT LOG
+         #if TESTING_MODE
+           currentEC += 0.1; 
+@@ -840,6 +1044,7 @@
+       digitalWrite(PIN_PUMP_C, PUMP_ON);
+       if (millis() - dosingTimer >= durC) {
+         digitalWrite(PIN_PUMP_C, PUMP_OFF);
++        recordPulse(2, durC);
+         logPulseEvent("TANK_K", durC, dosingAttempts, false); // EVENT LOG
+         #if TESTING_MODE
+           currentEC += 0.1; 
+@@ -850,7 +1055,25 @@
+       break;
+ 
+     case MIX_C:
+-      if (millis() - mixTimer >= MIX_DELAY_NUTRIENT) currentDosingState = IDLE;
++      if (millis() - mixTimer >= MIX_DELAY_NUTRIENT) {
++        // Response check: a dose that doesn't move EC means a dead/stuck probe, an empty bottle,
++        // or a blocked pump. Stop before emptying the bottles into the reservoir.
++        float actualRise = currentEC - ecBeforeDose;
++        // Only judge doses big enough to stand out from probe noise (~0.05 EC)
++        if (expectedEcRise >= 0.10f && actualRise < MIN_RESPONSE_FRACTION * expectedEcRise) {
++          noResponseCount++;
++          Serial.printf("WARNING: EC rose %.2f, expected ~%.2f (no-response %d/%d)\n",
++                        actualRise, expectedEcRise, noResponseCount, MAX_NO_RESPONSE_DOSES);
++          if (noResponseCount >= MAX_NO_RESPONSE_DOSES) {
++            dosingError = true;
++            lockoutReason = "NO EC RISE";
++            beep(1000);
++          }
++        } else {
++          noResponseCount = 0;
++        }
++        currentDosingState = IDLE;
++      }
+       break;
+ 
+     case DOSE_PH:
+@@ -885,14 +1108,24 @@
+   const float PH_DEADBAND = 0.20; 
+   const float EC_DEADBAND = 0.10; 
+ 
+-  bool ecNeedsDosing = (!isCurrentlyFlushing && (currentEC < targetEC - EC_DEADBAND));
++  bool ecNeedsDosing = (!isCurrentlyFlushing && !doseCapReachedToday && (currentEC < targetEC - EC_DEADBAND));
+   bool phNeedsDosing = (currentpH > targetpH + PH_DEADBAND);
+   // Hold off STARTING irrigation if chemistry needs fixing, 
+   // but if already watering (!isIrrigating is false), let the current cycle finish unless a dosing pump is actually active!
+   bool activelyFixingChemistry = (!dosingError && !waterTimeoutError && tempSensorConnected && (currentDosingState != IDLE || (!isIrrigating && (ecNeedsDosing || phNeedsDosing))));
+ 
+-  // Lethal overdose guard: block watering ONLY if water is dangerously acidic/alkaline or over-salted
+-  bool toxicBurnRisk = (currentpH < 4.5 || currentpH > 8.0) || (!isCurrentlyFlushing && currentEC > (targetEC + 0.80));
++  // Out-of-band chemistry is an ALARM only: a wilting plant dies faster than one watered at EC 2.
++  // (EC above target can't be fixed automatically - top up with fresh/RO water.)
++  chemistryAlarm = (!isCurrentlyFlushing && currentEC > (targetEC + EC_ALARM_MARGIN)) ||
++                   (currentpH < PH_ALARM_LOW) || (currentpH > PH_ALARM_HIGH);
++
++  // Block watering ONLY beyond absolute limits that would burn roots outright
++  bool toxicBurnRisk = (currentpH < PH_BLOCK_LOW || currentpH > PH_BLOCK_HIGH) || (currentEC > EC_BLOCK_LIMIT);
++  if (toxicBurnRisk != waterBlockedUnsafe) {
++    waterBlockedUnsafe = toxicBurnRisk;
++    forceDisplayUpdate = true;
++    if (toxicBurnRisk) Serial.println("ALERT: Reservoir beyond safe pH/EC limits - watering held. Replace the water.");
++  }
+ 
+   // Survival Mode: Wait while healthy dosing is in progress, but NEVER block watering on dosingError/temp faults unless water is toxic
+   if (!systemActive || dailyCycles == 0 || cycleDurationMins == 0 || tankEmptyISRFlag || activelyFixingChemistry || toxicBurnRisk) {
+@@ -951,7 +1184,9 @@
+   #else
+     const unsigned long LIGHT_HOURS = 12UL; // 06:00 to 18:00 daylight window
+     DateTime now = getSafeRTCNow();
+-    bool withinLightWindow = (now.hour() >= 6 && now.hour() < 18);
++    // Without an RTC the fallback clock restarts at 00:00 on every boot, which would mean
++    // 6 dry hours after each reboot - so water by the interval timer alone instead.
++    bool withinLightWindow = !rtcAvailable || (now.hour() >= 6 && now.hour() < 18);
+ 
+     unsigned long durationMs = (unsigned long)cycleDurationMins * 60000UL;
+     unsigned long slotMs = (LIGHT_HOURS * 3600000UL) / dailyCycles;
+@@ -1055,15 +1290,23 @@
+   // Bottom Row 2: Errors or Dosing State Machine Status
+   display.setCursor(2, 57);
+   if (dosingError) {
+-    display.print("ERR: PUMP LOCKOUT!");
++    display.print("ERR: "); display.print(lockoutReason); display.print("!");
+   } else if (waterTimeoutError) {
+     display.print("ERR: FILL TIMEOUT!");
+   } else if (!tempSensorConnected) {
+     display.print("ERR: TEMP SENSOR!");
+   } else if (tankEmptyISRFlag) {
+     display.print("ERR: TANK EMPTY!");
++  } else if (waterBlockedUnsafe) {
++    display.print("ERR: WATER UNSAFE!");
++  } else if (chemistryAlarm && !isIrrigating && currentDosingState == IDLE) {
++    display.print("WARN: pH/EC OUT BAND");
++  } else if (doseCapReachedToday && !isIrrigating && currentDosingState == IDLE) {
++    display.print("WARN: DOSE CAP TODAY");
+   } else if (tempHighAlarm && !isIrrigating && currentDosingState == IDLE) {
+     display.print("WARN: HIGH TEMP >24C");
++  } else if (clockWarning && !isIrrigating && currentDosingState == IDLE) {
++    display.print("WARN: CHECK CLOCK");
+   } else if (isIrrigating) {
+     unsigned long elapsedSecs = (millis() - lastIrrigationStart) / 1000UL;
+     #if TESTING_MODE
